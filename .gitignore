@@ -1,0 +1,7 @@
+/target/
+
+# Local runtime state used during manual Stillrun experiments.
+/.stillrun/
+*.db
+*.db-shm
+*.db-wal
