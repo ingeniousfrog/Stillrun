@@ -6,6 +6,9 @@ use crate::{
     config::StillrunConfig,
     db::{ExecutionStatus, HistoryFilter, JobRecord, Store},
     execution::{replay_execution, run_foreground, RunRequest},
+    history_import::{
+        import_selected_shell_history_with_progress, ImportShellSelection, TerminalImportProgress,
+    },
     jobs::status::RuntimeJobStatus,
     jobs::{self, BackgroundRunRequest},
     logs,
@@ -28,6 +31,7 @@ pub enum Commands {
     History(HistoryArgs),
     Replay(ReplayArgs),
     Promote(PromoteArgs),
+    ImportHistory(ImportHistoryArgs),
     Jobs,
     Logs(LogsArgs),
     Inspect(InspectArgs),
@@ -81,6 +85,14 @@ pub struct PromoteArgs {
     pub name: Option<String>,
     #[arg(long)]
     pub keep_alive: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct ImportHistoryArgs {
+    #[arg(long, value_enum, default_value_t = ImportShellSelection::Auto)]
+    pub shell: ImportShellSelection,
+    #[arg(long)]
+    pub file: Option<std::path::PathBuf>,
 }
 
 #[derive(Debug, Args)]
@@ -185,6 +197,19 @@ pub async fn run() -> Result<()> {
             )
             .await?;
             println!("{}", job_summary(&job));
+        }
+        Commands::ImportHistory(args) => {
+            let mut progress = TerminalImportProgress::stderr();
+            let summary = import_selected_shell_history_with_progress(
+                &store,
+                args.shell,
+                args.file,
+                &mut progress,
+            )?;
+            println!(
+                "imported={} skipped={} scanned={}",
+                summary.imported, summary.skipped, summary.scanned
+            );
         }
         Commands::Jobs => {
             for job in store.list_jobs()? {

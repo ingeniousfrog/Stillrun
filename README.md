@@ -1,5 +1,7 @@
 # Stillrun
 
+[中文文档](README.zh-CN.md)
+
 Stillrun is a command lifecycle runtime for macOS. It is not another shell
 history tool and it is not another PM2 clone: the core idea is that every
 terminal command can become a Job with history, logs, status, replay, and a
@@ -18,6 +20,8 @@ no TUI, no Web UI, and no AI layer in the first phase.
   SQLite FTS5.
 - `stillrun history --since-ms <epoch-ms> --until-ms <epoch-ms>` narrows history
   by execution start time.
+- `stillrun import-history --shell auto` imports existing local zsh, bash, and
+  fish shell history into Stillrun after explicit user consent.
 - `stillrun replay <id>` reruns a prior command from its original cwd with the
   captured non-sensitive environment, avoiding accidental leakage from the
   current shell environment.
@@ -40,6 +44,13 @@ no TUI, no Web UI, and no AI layer in the first phase.
   map to launchd bootout/bootstrap operations.
 
 ## Install From Source
+
+```sh
+./scripts/install.sh
+```
+
+The install script uses `cargo install --path . --force`, then asks whether to
+import existing local shell history. To skip the prompt, install directly:
 
 ```sh
 cargo install --path .
@@ -68,6 +79,14 @@ stillrun history --query "npm"
 stillrun history --cwd /path/to/project
 stillrun history --status success
 stillrun history --since-ms 1720000000000 --until-ms 1730000000000
+```
+
+Import existing shell history after install:
+
+```sh
+stillrun import-history --shell auto
+stillrun import-history --shell zsh --file ~/.zsh_history
+stillrun history --status imported --query "npm"
 ```
 
 Replay an execution:

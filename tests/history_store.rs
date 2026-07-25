@@ -147,6 +147,25 @@ fn filters_execution_history_by_started_time_range() {
     assert_eq!(matches[0].argv, vec!["echo", "middle"]);
 }
 
+#[test]
+fn blank_query_behaves_like_unfiltered_history() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = Store::open(temp.path().join("stillrun.db")).unwrap();
+    store.initialize().unwrap();
+    let expected = insert_test_execution(&store, "blank-query", 4_000);
+
+    let matches = store
+        .search_history(&HistoryFilter {
+            query: Some("\n \t".into()),
+            limit: 10,
+            ..HistoryFilter::default()
+        })
+        .unwrap();
+
+    assert_eq!(matches.len(), 1);
+    assert_eq!(matches[0].id, expected);
+}
+
 fn insert_test_execution(store: &Store, label: &str, started_at_ms: i64) -> i64 {
     store
         .insert_execution(&NewExecution {

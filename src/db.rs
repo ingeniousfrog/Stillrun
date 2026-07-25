@@ -28,6 +28,8 @@ pub struct ExecutionRecord {
     pub pid: Option<u32>,
     pub background_job_id: Option<String>,
     pub restart_count: i64,
+    pub source: String,
+    pub source_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -36,6 +38,7 @@ pub enum ExecutionStatus {
     Success,
     Failed,
     Background,
+    Imported,
 }
 
 impl ExecutionStatus {
@@ -45,6 +48,7 @@ impl ExecutionStatus {
             Self::Success => "success",
             Self::Failed => "failed",
             Self::Background => "background",
+            Self::Imported => "imported",
         }
     }
 
@@ -54,6 +58,7 @@ impl ExecutionStatus {
             "success" => Ok(Self::Success),
             "failed" => Ok(Self::Failed),
             "background" => Ok(Self::Background),
+            "imported" => Ok(Self::Imported),
             other => Err(StillrunError::invalid(format!(
                 "unknown execution status '{other}'"
             ))),
@@ -161,6 +166,14 @@ pub struct Store {
     conn: Connection,
 }
 
+struct PreparedExecution {
+    command: String,
+    argv_json: String,
+    env_json: String,
+    stdout: String,
+    stderr: String,
+}
+
 impl Store {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         if let Some(parent) = path.as_ref().parent() {
@@ -192,7 +205,9 @@ impl Store {
                 stderr TEXT NOT NULL,
                 pid INTEGER,
                 background_job_id TEXT,
-                restart_count INTEGER NOT NULL DEFAULT 0
+                restart_count INTEGER NOT NULL DEFAULT 0,
+                source TEXT NOT NULL DEFAULT 'stillrun',
+                source_id TEXT
             );
 
             CREATE VIRTUAL TABLE IF NOT EXISTS executions_fts USING fts5(
@@ -251,6 +266,12 @@ impl Store {
             CREATE INDEX IF NOT EXISTS idx_jobs_name ON jobs(name);
             "#,
         )?;
+        self.ensure_executions_column("source", "TEXT NOT NULL DEFAULT 'stillrun'")?;
+        self.ensure_executions_column("source_id", "TEXT")?;
+        self.conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_executions_source_id ON executions(source, source_id) WHERE source_id IS NOT NULL",
+            [],
+        )?;
         self.ensure_jobs_column("keep_alive", "INTEGER NOT NULL DEFAULT 0")?;
         self.ensure_jobs_column("last_cpu_percent", "REAL")?;
         self.ensure_jobs_column("last_rss_kb", "INTEGER")?;
@@ -258,24 +279,53 @@ impl Store {
     }
 
     pub fn insert_execution(&self, record: &NewExecution) -> Result<i64> {
-        let argv = redact::redact_argv(&record.argv);
-        let command = redact::redact_inline_secrets(&format_argv(&argv));
-        let argv_json = serde_json::to_string(&argv)?;
-        let env_json = serde_json::to_string(&record.context.env)?;
-        let stdout = redact::redact_inline_secrets(&record.stdout);
-        let stderr = redact::redact_inline_secrets(&record.stderr);
+        self.insert_execution_internal(record, "stillrun", None, None, false)
+            .map(|id| id.expect("normal executions are never ignored"))
+    }
+
+    pub fn insert_imported_execution(
+        &self,
+        record: &NewExecution,
+        source: &str,
+        source_id: &str,
+        command: &str,
+    ) -> Result<Option<i64>> {
+        let inserted =
+            self.insert_execution_internal(record, source, Some(source_id), Some(command), true)?;
+        if inserted.is_none() {
+            self.refresh_imported_execution(record, source, source_id, command)?;
+        }
+        Ok(inserted)
+    }
+
+    fn insert_execution_internal(
+        &self,
+        record: &NewExecution,
+        source: &str,
+        source_id: Option<&str>,
+        command_override: Option<&str>,
+        ignore_duplicate: bool,
+    ) -> Result<Option<i64>> {
+        let prepared = prepare_execution(record, command_override)?;
+        let insert_clause = if ignore_duplicate {
+            "INSERT OR IGNORE"
+        } else {
+            "INSERT"
+        };
 
         self.conn.execute(
-            r#"
-            INSERT INTO executions (
+            &format!(
+                r#"
+            {insert_clause} INTO executions (
                 command, argv_json, cwd, git_repo, git_branch, started_at_ms, ended_at_ms,
                 duration_ms, exit_code, status, env_json, stdout, stderr, pid,
-                background_job_id, restart_count
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
-            "#,
+                background_job_id, restart_count, source, source_id
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)
+            "#
+            ),
             params![
-                command,
-                argv_json,
+                prepared.command,
+                prepared.argv_json,
                 record.context.cwd.to_string_lossy().to_string(),
                 record
                     .context
@@ -288,15 +338,77 @@ impl Store {
                 record.duration_ms,
                 record.exit_code,
                 record.status.as_str(),
-                env_json,
-                stdout,
-                stderr,
+                prepared.env_json,
+                prepared.stdout,
+                prepared.stderr,
+                record.pid.map(i64::from),
+                record.background_job_id,
+                record.restart_count,
+                source,
+                source_id,
+            ],
+        )?;
+        if ignore_duplicate && self.conn.changes() == 0 {
+            return Ok(None);
+        }
+        Ok(Some(self.conn.last_insert_rowid()))
+    }
+
+    fn refresh_imported_execution(
+        &self,
+        record: &NewExecution,
+        source: &str,
+        source_id: &str,
+        command_override: &str,
+    ) -> Result<()> {
+        let prepared = prepare_execution(record, Some(command_override))?;
+        self.conn.execute(
+            r#"
+            UPDATE executions
+            SET command = ?3,
+                argv_json = ?4,
+                cwd = ?5,
+                git_repo = ?6,
+                git_branch = ?7,
+                started_at_ms = ?8,
+                ended_at_ms = ?9,
+                duration_ms = ?10,
+                exit_code = ?11,
+                status = ?12,
+                env_json = ?13,
+                stdout = ?14,
+                stderr = ?15,
+                pid = ?16,
+                background_job_id = ?17,
+                restart_count = ?18
+            WHERE source = ?1 AND source_id = ?2 AND status = 'imported'
+            "#,
+            params![
+                source,
+                source_id,
+                prepared.command,
+                prepared.argv_json,
+                record.context.cwd.to_string_lossy().to_string(),
+                record
+                    .context
+                    .git_repo
+                    .as_ref()
+                    .map(|path| path.to_string_lossy().to_string()),
+                record.context.git_branch,
+                record.started_at_ms,
+                record.ended_at_ms,
+                record.duration_ms,
+                record.exit_code,
+                record.status.as_str(),
+                prepared.env_json,
+                prepared.stdout,
+                prepared.stderr,
                 record.pid.map(i64::from),
                 record.background_job_id,
                 record.restart_count,
             ],
         )?;
-        Ok(self.conn.last_insert_rowid())
+        Ok(())
     }
 
     pub fn get_execution(&self, _id: i64) -> Result<ExecutionRecord> {
@@ -437,8 +549,16 @@ impl Store {
             })
     }
 
+    fn ensure_executions_column(&self, name: &str, column_type: &str) -> Result<()> {
+        self.ensure_column("executions", name, column_type)
+    }
+
     fn ensure_jobs_column(&self, name: &str, column_type: &str) -> Result<()> {
-        let mut statement = self.conn.prepare("PRAGMA table_info(jobs)")?;
+        self.ensure_column("jobs", name, column_type)
+    }
+
+    fn ensure_column(&self, table: &str, name: &str, column_type: &str) -> Result<()> {
+        let mut statement = self.conn.prepare(&format!("PRAGMA table_info({table})"))?;
         let columns = statement
             .query_map([], |row| row.get::<_, String>("name"))?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -446,11 +566,28 @@ impl Store {
             return Ok(());
         }
         self.conn.execute(
-            &format!("ALTER TABLE jobs ADD COLUMN {name} {column_type}"),
+            &format!("ALTER TABLE {table} ADD COLUMN {name} {column_type}"),
             [],
         )?;
         Ok(())
     }
+}
+
+fn prepare_execution(
+    record: &NewExecution,
+    command_override: Option<&str>,
+) -> Result<PreparedExecution> {
+    let argv = redact::redact_argv(&record.argv);
+    let command_source = command_override
+        .map(str::to_string)
+        .unwrap_or_else(|| format_argv(&argv));
+    Ok(PreparedExecution {
+        command: redact::redact_inline_secrets(&command_source),
+        argv_json: serde_json::to_string(&argv)?,
+        env_json: serde_json::to_string(&record.context.env)?,
+        stdout: redact::redact_inline_secrets(&record.stdout),
+        stderr: redact::redact_inline_secrets(&record.stderr),
+    })
 }
 
 pub fn format_argv(argv: &[String]) -> String {
@@ -467,7 +604,12 @@ pub fn format_argv(argv: &[String]) -> String {
 }
 
 fn history_sql(filter: &HistoryFilter) -> String {
-    let fts_prefix = if filter.query.is_some() {
+    let fts_prefix = if filter
+        .query
+        .as_deref()
+        .and_then(normalized_fts_query)
+        .is_some()
+    {
         "SELECT e.* FROM executions e JOIN executions_fts ON executions_fts.rowid = e.id WHERE executions_fts MATCH ?"
     } else {
         "SELECT e.* FROM executions e WHERE 1 = 1"
@@ -501,8 +643,9 @@ fn history_sql(filter: &HistoryFilter) -> String {
 fn history_values(filter: &HistoryFilter) -> Vec<Value> {
     let query_value = filter
         .query
-        .as_ref()
-        .map(|query| Value::Text(fts_phrase_query(query)))
+        .as_deref()
+        .and_then(normalized_fts_query)
+        .map(Value::Text)
         .into_iter();
     let cwd_value = filter
         .cwd
@@ -533,12 +676,17 @@ fn history_values(filter: &HistoryFilter) -> Vec<Value> {
         .collect()
 }
 
-fn fts_phrase_query(query: &str) -> String {
-    query
+fn normalized_fts_query(query: &str) -> Option<String> {
+    let value = query
         .split_whitespace()
         .map(|term| format!("\"{}\"", term.replace('"', "\"\"")))
         .collect::<Vec<_>>()
-        .join(" ")
+        .join(" ");
+    if value.is_empty() {
+        None
+    } else {
+        Some(value)
+    }
 }
 
 fn limit_or_default(limit: usize) -> usize {
@@ -572,6 +720,8 @@ fn map_execution_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ExecutionRecor
         pid: row.get::<_, Option<i64>>("pid")?.map(|pid| pid as u32),
         background_job_id: row.get("background_job_id")?,
         restart_count: row.get("restart_count")?,
+        source: row.get("source")?,
+        source_id: row.get("source_id")?,
     })
 }
 

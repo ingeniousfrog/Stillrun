@@ -1,3 +1,5 @@
+use std::fs;
+
 use assert_cmd::Command;
 use predicates::str::contains;
 use stillrun::db::{JobRecord, JobStatus, Store};
@@ -89,6 +91,54 @@ fn cli_status_prints_job_runtime_summary() {
         .stdout(contains("runtime="))
         .stdout(contains("label: com.stillrun.dev.1"))
         .stdout(contains("stdout:"));
+}
+
+#[test]
+fn cli_import_history_makes_shell_history_searchable() {
+    let temp = tempfile::tempdir().unwrap();
+    let history_path = temp.path().join("zsh_history");
+    fs::write(&history_path, ": 1700000000:0;npm run cli-import\n").unwrap();
+
+    Command::cargo_bin("stillrun")
+        .unwrap()
+        .env("STILLRUN_HOME", temp.path())
+        .env("HOME", temp.path())
+        .args([
+            "import-history",
+            "--shell",
+            "zsh",
+            "--file",
+            history_path.to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .stdout(contains("imported=1"))
+        .stdout(contains("skipped=0"));
+
+    Command::cargo_bin("stillrun")
+        .unwrap()
+        .env("STILLRUN_HOME", temp.path())
+        .env("HOME", temp.path())
+        .args(["history", "--query", "cli-import"])
+        .assert()
+        .success()
+        .stdout(contains("npm run cli-import"));
+
+    Command::cargo_bin("stillrun")
+        .unwrap()
+        .env("STILLRUN_HOME", temp.path())
+        .env("HOME", temp.path())
+        .args([
+            "import-history",
+            "--shell",
+            "zsh",
+            "--file",
+            history_path.to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .stdout(contains("imported=0"))
+        .stdout(contains("skipped=1"));
 }
 
 fn job_record(root: &std::path::Path) -> JobRecord {
