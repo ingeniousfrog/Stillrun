@@ -1,10 +1,14 @@
 pub mod cli;
+pub mod completion;
 pub mod config;
+mod config_cli;
 pub mod context;
 pub mod db;
 pub mod error;
 pub mod execution;
 pub mod history_import;
+pub mod inspect;
+mod job_cli;
 pub mod jobs;
 pub mod logs;
 pub mod output;

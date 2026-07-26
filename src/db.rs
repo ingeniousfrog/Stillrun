@@ -1,4 +1,7 @@
-use std::path::{Path, PathBuf};
+use std::{
+    collections::BTreeSet,
+    path::{Path, PathBuf},
+};
 
 use rusqlite::{
     params, params_from_iter,
@@ -91,6 +94,14 @@ pub struct HistoryFilter {
     pub started_after_ms: Option<i64>,
     pub started_before_ms: Option<i64>,
     pub limit: usize,
+    pub sort: HistorySortOrder,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum HistorySortOrder {
+    #[default]
+    NewestFirst,
+    OldestFirst,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -529,6 +540,17 @@ impl Store {
             .map_err(StillrunError::from)
     }
 
+    pub fn execution_source_id_exists(&self, source: &str, source_id: &str) -> Result<bool> {
+        self.conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM executions WHERE source = ?1 AND source_id = ?2)",
+                params![source, source_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .map(|exists| exists != 0)
+            .map_err(StillrunError::from)
+    }
+
     pub fn delete_execution(&self, id: i64) -> Result<bool> {
         let deleted = self
             .conn
@@ -778,6 +800,21 @@ impl Store {
             .map_err(StillrunError::from)
     }
 
+    pub fn job_completion_candidates(&self, prefix: &str) -> Result<Vec<String>> {
+        let prefix = prefix.to_ascii_lowercase();
+        let candidates = self
+            .list_jobs()?
+            .into_iter()
+            .flat_map(|job| [job.name, job.id, job.label])
+            .filter(|candidate| {
+                prefix.is_empty() || candidate.to_ascii_lowercase().starts_with(&prefix)
+            })
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        Ok(candidates)
+    }
+
     pub fn find_job(&self, target: &str) -> Result<JobRecord> {
         self.conn
             .query_row(
@@ -898,8 +935,12 @@ fn history_sql(filter: &HistoryFilter) -> String {
         .as_ref()
         .map(|_| " AND e.started_at_ms <= ?")
         .unwrap_or("");
+    let order = match filter.sort {
+        HistorySortOrder::NewestFirst => "DESC",
+        HistorySortOrder::OldestFirst => "ASC",
+    };
     format!(
-        "{prefix}{cwd_clause}{repo_clause}{status_clause}{started_after_clause}{started_before_clause} ORDER BY e.started_at_ms DESC LIMIT ?"
+        "{prefix}{cwd_clause}{repo_clause}{status_clause}{started_after_clause}{started_before_clause} ORDER BY e.started_at_ms {order}, e.id {order} LIMIT ?"
     )
 }
 

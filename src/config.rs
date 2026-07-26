@@ -39,4 +39,55 @@ impl StillrunConfig {
         let config_text = std::fs::read_to_string(&paths.config_path)?;
         Ok(toml::from_str(&config_text)?)
     }
+
+    pub fn save(&self, paths: &StillrunPaths) -> Result<()> {
+        if let Some(parent) = paths.config_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let text = toml::to_string_pretty(self)?;
+        std::fs::write(&paths.config_path, text)?;
+        Ok(())
+    }
+
+    pub fn set_value(&mut self, key: &str, value: &str) -> Result<()> {
+        match normalize_key(key).as_str() {
+            "max_output_bytes" => {
+                let parsed = value.parse::<usize>().map_err(|_| {
+                    crate::StillrunError::invalid("max-output-bytes must be a positive integer")
+                })?;
+                if parsed == 0 {
+                    return Err(crate::StillrunError::invalid(
+                        "max-output-bytes must be greater than zero",
+                    ));
+                }
+                self.max_output_bytes = parsed;
+                Ok(())
+            }
+            other => Err(crate::StillrunError::invalid(format!(
+                "unknown config key '{other}'"
+            ))),
+        }
+    }
+
+    pub fn add_redact_key(&mut self, key: &str) -> Result<bool> {
+        let key = normalize_redact_key(key)?;
+        Ok(self.redact_keys.insert(key))
+    }
+
+    pub fn remove_redact_key(&mut self, key: &str) -> Result<bool> {
+        let key = normalize_redact_key(key)?;
+        Ok(self.redact_keys.remove(&key))
+    }
+}
+
+fn normalize_key(key: &str) -> String {
+    key.trim().replace('-', "_")
+}
+
+fn normalize_redact_key(key: &str) -> Result<String> {
+    let key = key.trim().to_ascii_lowercase();
+    if key.is_empty() {
+        return Err(crate::StillrunError::invalid("redact key cannot be empty"));
+    }
+    Ok(key)
 }

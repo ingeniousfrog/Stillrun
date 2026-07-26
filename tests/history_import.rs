@@ -5,7 +5,8 @@ use stillrun::{
     history_import::{
         decode_history_bytes, decode_shell_history_bytes, format_import_progress,
         import_shell_history_file, import_shell_history_file_with_progress, parse_fish_history,
-        parse_zsh_history, ImportProgressReporter, ImportProgressSnapshot, ShellKind,
+        parse_zsh_history, preview_shell_history_file, ImportProgressReporter,
+        ImportProgressSnapshot, ShellKind,
     },
 };
 
@@ -78,6 +79,62 @@ python scripts/prompt.py
     assert_eq!(matches[0].status, ExecutionStatus::Imported);
     assert_eq!(matches[0].cwd, home);
     assert!(matches[0].source.starts_with("shell:zsh:"));
+}
+
+#[test]
+fn previews_shell_history_import_without_writing() {
+    let temp = tempfile::tempdir().unwrap();
+    let history_path = temp.path().join(".zsh_history");
+    fs::write(
+        &history_path,
+        r#": 1700000000:0;npm run dev
+: 1700000001:0;
+python scripts/prompt.py
+"#,
+    )
+    .unwrap();
+    let store = Store::open(temp.path().join("stillrun.db")).unwrap();
+    store.initialize().unwrap();
+    let home = PathBuf::from("/Users/tester");
+
+    let preview = preview_shell_history_file(&store, &history_path, ShellKind::Zsh, &home).unwrap();
+    let matches = store
+        .search_history(&HistoryFilter {
+            status: Some(ExecutionStatus::Imported),
+            limit: 10,
+            ..HistoryFilter::default()
+        })
+        .unwrap();
+
+    assert_eq!(preview.scanned, 3);
+    assert_eq!(preview.would_import, 2);
+    assert_eq!(preview.empty, 1);
+    assert_eq!(preview.files.len(), 1);
+    assert_eq!(preview.files[0].path, history_path);
+    assert!(matches.is_empty());
+}
+
+#[test]
+fn preview_counts_existing_source_ids_as_duplicates() {
+    let temp = tempfile::tempdir().unwrap();
+    let history_path = temp.path().join(".zsh_history");
+    fs::write(
+        &history_path,
+        r#": 1700000000:0;npm run dev
+python scripts/prompt.py
+"#,
+    )
+    .unwrap();
+    let store = Store::open(temp.path().join("stillrun.db")).unwrap();
+    store.initialize().unwrap();
+    let home = PathBuf::from("/Users/tester");
+
+    import_shell_history_file(&store, &history_path, ShellKind::Zsh, &home).unwrap();
+    let preview = preview_shell_history_file(&store, &history_path, ShellKind::Zsh, &home).unwrap();
+
+    assert_eq!(preview.scanned, 2);
+    assert_eq!(preview.duplicates, 2);
+    assert_eq!(preview.would_import, 0);
 }
 
 #[test]

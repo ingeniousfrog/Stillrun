@@ -2,7 +2,7 @@ use std::{collections::BTreeMap, path::PathBuf};
 
 use stillrun::{
     context::CommandContext,
-    db::{ExecutionStatus, HistoryFilter, NewExecution, Store},
+    db::{ExecutionStatus, HistoryFilter, HistorySortOrder, NewExecution, Store},
 };
 
 #[test]
@@ -145,6 +145,47 @@ fn filters_execution_history_by_started_time_range() {
     assert_eq!(matches.len(), 1);
     assert_eq!(matches[0].id, expected);
     assert_eq!(matches[0].argv, vec!["echo", "middle"]);
+}
+
+#[test]
+fn sorts_history_newest_or_oldest_first() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = Store::open(temp.path().join("stillrun.db")).unwrap();
+    store.initialize().unwrap();
+
+    insert_test_execution(&store, "old", 1_000);
+    insert_test_execution(&store, "middle", 2_000);
+    insert_test_execution(&store, "new", 3_000);
+
+    let newest = store
+        .search_history(&HistoryFilter {
+            sort: HistorySortOrder::NewestFirst,
+            limit: 10,
+            ..HistoryFilter::default()
+        })
+        .unwrap();
+    let oldest = store
+        .search_history(&HistoryFilter {
+            sort: HistorySortOrder::OldestFirst,
+            limit: 10,
+            ..HistoryFilter::default()
+        })
+        .unwrap();
+
+    assert_eq!(
+        newest
+            .iter()
+            .map(|record| record.command.as_str())
+            .collect::<Vec<_>>(),
+        vec!["echo new", "echo middle", "echo old"]
+    );
+    assert_eq!(
+        oldest
+            .iter()
+            .map(|record| record.command.as_str())
+            .collect::<Vec<_>>(),
+        vec!["echo old", "echo middle", "echo new"]
+    );
 }
 
 #[test]

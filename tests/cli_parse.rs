@@ -1,6 +1,6 @@
 use clap::Parser;
 use stillrun::{
-    cli::{Cli, Commands},
+    cli::{Cli, Commands, HistorySort},
     history_import::ImportShellSelection,
 };
 
@@ -68,6 +68,16 @@ fn parses_history_display_flags() {
             assert!(args.pager);
             assert_eq!(args.width, Some(90));
         }
+        other => panic!("expected history command, got {other:?}"),
+    }
+}
+
+#[test]
+fn parses_history_sort_order() {
+    let cli = Cli::try_parse_from(["stillrun", "history", "--sort", "oldest"]).unwrap();
+
+    match cli.command {
+        Commands::History(args) => assert_eq!(args.sort, HistorySort::Oldest),
         other => panic!("expected history command, got {other:?}"),
     }
 }
@@ -238,5 +248,123 @@ fn parses_hook_record_command() {
             other => panic!("expected hook record command, got {other:?}"),
         },
         other => panic!("expected hook command, got {other:?}"),
+    }
+}
+
+#[test]
+fn parses_replay_safety_flags() {
+    let cli = Cli::try_parse_from(["stillrun", "replay", "42", "--preview", "--yes"]).unwrap();
+
+    match cli.command {
+        Commands::Replay(args) => {
+            assert_eq!(args.id, 42);
+            assert!(args.preview);
+            assert!(args.yes);
+        }
+        other => panic!("expected replay command, got {other:?}"),
+    }
+}
+
+#[test]
+fn parses_import_history_preview_and_confirmation_flags() {
+    let cli = Cli::try_parse_from([
+        "stillrun",
+        "import-history",
+        "--shell",
+        "zsh",
+        "--file",
+        "/tmp/zsh_history",
+        "--preview",
+        "--yes",
+    ])
+    .unwrap();
+
+    match cli.command {
+        Commands::ImportHistory(args) => {
+            assert_eq!(args.shell, ImportShellSelection::Zsh);
+            assert!(args.preview);
+            assert!(args.yes);
+        }
+        other => panic!("expected import-history command, got {other:?}"),
+    }
+}
+
+#[test]
+fn parses_inspect_json_flag() {
+    let cli = Cli::try_parse_from(["stillrun", "inspect", "dev-server", "--json"]).unwrap();
+
+    match cli.command {
+        Commands::Inspect(args) => {
+            assert_eq!(args.target, "dev-server");
+            assert!(args.json);
+        }
+        other => panic!("expected inspect command, got {other:?}"),
+    }
+}
+
+#[test]
+fn parses_config_commands() {
+    let set =
+        Cli::try_parse_from(["stillrun", "config", "set", "max-output-bytes", "4096"]).unwrap();
+    let add = Cli::try_parse_from(["stillrun", "config", "redact", "add", "session"]).unwrap();
+
+    match set.command {
+        Commands::Config(args) => match args.action {
+            stillrun::cli::ConfigCommand::Set(set_args) => {
+                assert_eq!(set_args.key, "max-output-bytes");
+                assert_eq!(set_args.value, "4096");
+            }
+            other => panic!("expected config set command, got {other:?}"),
+        },
+        other => panic!("expected config command, got {other:?}"),
+    }
+
+    match add.command {
+        Commands::Config(args) => match args.action {
+            stillrun::cli::ConfigCommand::Redact(redact_args) => match redact_args.action {
+                stillrun::cli::ConfigRedactCommand::Add(add_args) => {
+                    assert_eq!(add_args.key, "session");
+                }
+                other => panic!("expected config redact add command, got {other:?}"),
+            },
+            other => panic!("expected config redact command, got {other:?}"),
+        },
+        other => panic!("expected config command, got {other:?}"),
+    }
+}
+
+#[test]
+fn parses_completion_commands() {
+    let script = Cli::try_parse_from(["stillrun", "completion", "zsh"]).unwrap();
+    let candidates = Cli::try_parse_from([
+        "stillrun",
+        "completion",
+        "candidates",
+        "jobs",
+        "--prefix",
+        "dev",
+    ])
+    .unwrap();
+
+    match script.command {
+        Commands::Completion(args) => match args.action {
+            stillrun::cli::CompletionCommand::Zsh => {}
+            other => panic!("expected zsh completion command, got {other:?}"),
+        },
+        other => panic!("expected completion command, got {other:?}"),
+    }
+
+    match candidates.command {
+        Commands::Completion(args) => match args.action {
+            stillrun::cli::CompletionCommand::Candidates(candidate_args) => {
+                assert_eq!(
+                    candidate_args.kind,
+                    stillrun::cli::CompletionCandidateKind::Jobs
+                );
+                assert_eq!(candidate_args.prefix, "dev");
+            }
+            other => panic!("expected completion candidates command, got {other:?}"),
+        },
+        other => panic!("expected completion command, got {other:?}"),
     }
 }

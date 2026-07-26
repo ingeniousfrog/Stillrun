@@ -1,5 +1,6 @@
 use std::process::Stdio;
 
+use serde::Serialize;
 use tokio::process::Command;
 
 use crate::{
@@ -8,7 +9,7 @@ use crate::{
     Result, StillrunError,
 };
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct RuntimeJobStatus {
     pub status: JobStatus,
     pub pid: Option<u32>,
@@ -34,7 +35,7 @@ impl RuntimeJobStatus {
 pub async fn resolve_runtime_status(job: &JobRecord) -> Result<RuntimeJobStatus> {
     Ok(resolve_loaded_runtime_status(job)
         .await?
-        .unwrap_or_else(|| RuntimeJobStatus {
+        .unwrap_or(RuntimeJobStatus {
             status: JobStatus::Stopped,
             pid: None,
             cpu_percent: None,

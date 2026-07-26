@@ -1,31 +1,60 @@
 use std::{
     io::{self, IsTerminal, Write},
     process::{Command as StdCommand, Stdio},
-    time::Duration,
 };
 
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
+
+pub use crate::{
+    completion::{CompletionArgs, CompletionCandidateKind, CompletionCommand},
+    config_cli::{ConfigArgs, ConfigCommand, ConfigRedactCommand},
+    job_cli::{
+        JobDeleteArgs, JobEventsArgs, JobMonitorArgs, JobSamplesArgs, JobsArgs, JobsCommand,
+    },
+};
 
 use crate::{
     config::StillrunConfig,
-    db::{ExecutionStatus, HistoryFilter, JobRecord, Store},
+    db::{ExecutionStatus, HistoryFilter, HistorySortOrder, Store},
     execution::{replay_execution, run_foreground, RunRequest},
     history_import::{
-        import_selected_shell_history_with_progress, ImportShellSelection, ShellKind,
+        format_import_preview, import_selected_shell_history_with_progress,
+        preview_selected_shell_history, ImportPreview, ImportShellSelection, ShellKind,
         TerminalImportProgress,
     },
-    jobs::status::RuntimeJobStatus,
+    inspect,
     jobs::{self, BackgroundRunRequest},
     logs,
-    output::{execution_summary, format_history_table, job_summary, HistoryDisplayOptions},
+    output::{format_history_table, job_summary, HistoryDisplayOptions},
     paths::StillrunPaths,
     shell_hook::{self, ShellHookRecord},
     Result,
 };
 
+const ROOT_HELP: &str = r#"Capabilities
+  Run and record:       stillrun run -- npm run dev
+  Search history:       stillrun history --query "npm" --sort oldest
+  Import shell history: stillrun import-history --shell auto --preview
+  Replay safely:        stillrun replay 12 --preview
+  Promote to Job:       stillrun promote 12 --name dev-server
+  Manage Jobs:          stillrun jobs | stillrun status dev-server | stillrun logs dev-server
+  Inspect as JSON:      stillrun inspect 12 --json
+  Manage config:        stillrun config show | stillrun config set max-output-bytes 2097152
+  Shell completion:     stillrun completion zsh > ~/.stillrun-completion.zsh
+
+Examples
+  stillrun run -- zsh -lc "npm run dev 2>&1 | tee dev.log"
+  stillrun history --status imported --query "cargo"
+  stillrun run --background --name api -- cargo run
+  stillrun jobs monitor api --once --cpu-alert 90 --rss-alert-mb 1024
+  stillrun config redact add session_token
+
+Use `stillrun <command> -h` for command-specific flags."#;
+
 #[derive(Debug, Parser)]
 #[command(name = "stillrun")]
 #[command(about = "Command lifecycle runtime for macOS jobs.")]
+#[command(after_help = ROOT_HELP)]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Commands,
@@ -33,19 +62,36 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Commands {
+    #[command(about = "Run and record a foreground command.")]
     Run(RunArgs),
+    #[command(about = "Search, inspect, and maintain execution history.")]
     History(HistoryArgs),
+    #[command(about = "Replay a recorded execution.")]
     Replay(ReplayArgs),
+    #[command(about = "Promote a recorded execution into a launchd Job.")]
     Promote(PromoteArgs),
+    #[command(about = "Preview and import local shell history.")]
     ImportHistory(ImportHistoryArgs),
+    #[command(about = "List and manage background Jobs.")]
     Jobs(JobsArgs),
+    #[command(about = "Read or follow Job stdout/stderr logs.")]
     Logs(LogsArgs),
+    #[command(about = "Inspect an execution or Job, optionally as JSON.")]
     Inspect(InspectArgs),
+    #[command(about = "Show one Job's runtime status.")]
     Status(JobTargetArgs),
+    #[command(about = "Start a stored Job.")]
     Start(JobTargetArgs),
+    #[command(about = "Stop a stored Job.")]
     Stop(JobTargetArgs),
+    #[command(about = "Restart a stored Job.")]
     Restart(JobTargetArgs),
+    #[command(about = "Install, print, or record shell hook events.")]
     Hook(HookArgs),
+    #[command(about = "Show and update local Stillrun config.")]
+    Config(ConfigArgs),
+    #[command(about = "Print shell completion scripts or dynamic candidates.")]
+    Completion(CompletionArgs),
 }
 
 #[derive(Debug, Args)]
@@ -90,6 +136,23 @@ pub struct HistoryArgs {
     pub no_pager: bool,
     #[arg(long)]
     pub width: Option<usize>,
+    #[arg(long, value_enum, default_value_t = HistorySort::Newest)]
+    pub sort: HistorySort,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum HistorySort {
+    Newest,
+    Oldest,
+}
+
+impl From<HistorySort> for HistorySortOrder {
+    fn from(value: HistorySort) -> Self {
+        match value {
+            HistorySort::Newest => Self::NewestFirst,
+            HistorySort::Oldest => Self::OldestFirst,
+        }
+    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -127,6 +190,10 @@ pub struct HistoryPruneArgs {
 #[derive(Debug, Args)]
 pub struct ReplayArgs {
     pub id: i64,
+    #[arg(long)]
+    pub preview: bool,
+    #[arg(long)]
+    pub yes: bool,
 }
 
 #[derive(Debug, Args)]
@@ -144,58 +211,10 @@ pub struct ImportHistoryArgs {
     pub shell: ImportShellSelection,
     #[arg(long)]
     pub file: Option<std::path::PathBuf>,
-}
-
-#[derive(Debug, Args)]
-pub struct JobsArgs {
-    #[command(subcommand)]
-    pub action: Option<JobsCommand>,
-}
-
-#[derive(Debug, Subcommand)]
-pub enum JobsCommand {
-    Delete(JobDeleteArgs),
-    Monitor(JobMonitorArgs),
-    Events(JobEventsArgs),
-    Samples(JobSamplesArgs),
-}
-
-#[derive(Debug, Args)]
-pub struct JobDeleteArgs {
-    pub job: String,
     #[arg(long)]
-    pub keep_plist: bool,
-}
-
-#[derive(Debug, Args)]
-pub struct JobMonitorArgs {
-    pub job: String,
-    #[arg(long, default_value_t = 5)]
-    pub interval_secs: u64,
+    pub preview: bool,
     #[arg(long)]
-    pub once: bool,
-    #[arg(long)]
-    pub cpu_alert: Option<f32>,
-    #[arg(long)]
-    pub rss_alert_mb: Option<u64>,
-}
-
-#[derive(Debug, Args)]
-pub struct JobEventsArgs {
-    pub job: String,
-    #[arg(short, long, default_value_t = 50)]
-    pub limit: usize,
-    #[arg(short, long)]
-    pub follow: bool,
-    #[arg(long, default_value_t = 2)]
-    pub interval_secs: u64,
-}
-
-#[derive(Debug, Args)]
-pub struct JobSamplesArgs {
-    pub job: String,
-    #[arg(short, long, default_value_t = 50)]
-    pub limit: usize,
+    pub yes: bool,
 }
 
 #[derive(Debug, Args)]
@@ -212,6 +231,8 @@ pub struct LogsArgs {
 #[derive(Debug, Args)]
 pub struct InspectArgs {
     pub target: String,
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(Debug, Args)]
@@ -355,6 +376,7 @@ pub async fn run() -> Result<()> {
                     started_after_ms: args.since_ms,
                     started_before_ms: args.until_ms,
                     limit: args.limit,
+                    sort: args.sort.into(),
                 })?;
                 let output = format_history_table(
                     &records,
@@ -371,6 +393,14 @@ pub async fn run() -> Result<()> {
             }
         },
         Commands::Replay(args) => {
+            let record = store.get_execution(args.id)?;
+            if args.preview {
+                print!("{}", inspect::format_replay_preview(&record));
+                return Ok(());
+            }
+            if requires_replay_confirmation(&record) {
+                ensure_replay_confirmed(args.yes, &record)?;
+            }
             let outcome = replay_execution(&store, &config, args.id).await?;
             write_command_output(&outcome.stdout, &outcome.stderr)?;
             exit_with_command_status(outcome.exit_code);
@@ -388,6 +418,12 @@ pub async fn run() -> Result<()> {
             println!("{}", job_summary(&job));
         }
         Commands::ImportHistory(args) => {
+            let preview = preview_selected_shell_history(&store, args.shell, args.file.clone())?;
+            print!("{}", format_import_preview(&preview));
+            if args.preview {
+                return Ok(());
+            }
+            ensure_import_confirmed(args.yes, &preview)?;
             let mut progress = TerminalImportProgress::stderr();
             let summary = import_selected_shell_history_with_progress(
                 &store,
@@ -400,31 +436,9 @@ pub async fn run() -> Result<()> {
                 summary.imported, summary.skipped, summary.scanned
             );
         }
-        Commands::Jobs(args) => match args.action {
-            Some(JobsCommand::Delete(delete_args)) => {
-                let job =
-                    jobs::delete_job(&store, &delete_args.job, delete_args.keep_plist).await?;
-                println!("deleted job {} plist={}", job.id, job.plist_path.display());
-            }
-            Some(JobsCommand::Monitor(monitor_args)) => {
-                monitor_job(&store, monitor_args).await?;
-            }
-            Some(JobsCommand::Events(events_args)) => {
-                print_job_events(&store, events_args).await?;
-            }
-            Some(JobsCommand::Samples(samples_args)) => {
-                let job = store.find_job(&samples_args.job)?;
-                for sample in store.list_job_resource_samples(&job.id, samples_args.limit)? {
-                    println!("{}", format_job_sample(&sample));
-                }
-            }
-            None => {
-                for job in store.list_jobs()? {
-                    let (synced_job, runtime) = resolve_and_sync_job_runtime(&store, job).await;
-                    println!("{} {}", job_summary(&synced_job), runtime_suffix(&runtime));
-                }
-            }
-        },
+        Commands::Jobs(args) => {
+            crate::job_cli::handle_jobs_command(&store, args).await?;
+        }
         Commands::Logs(args) => {
             let job = store.find_job(&args.job)?;
             let log_path = if args.stderr {
@@ -446,50 +460,42 @@ pub async fn run() -> Result<()> {
         Commands::Inspect(args) => {
             if let Ok(id) = args.target.parse::<i64>() {
                 let record = store.get_execution(id)?;
-                println!("{}", execution_summary(&record));
-                println!("cwd: {}", record.cwd.display());
-                if let Some(repo) = record.git_repo {
-                    println!("git repo: {}", repo.display());
+                if args.json {
+                    println!(
+                        "{}",
+                        serde_json::to_string(&inspect::execution_payload(record))?
+                    );
+                } else {
+                    print!("{}", inspect::format_execution_inspect(&record));
                 }
-                if let Some(branch) = record.git_branch {
-                    println!("git branch: {branch}");
-                }
-                println!("exit code: {:?}", record.exit_code);
-                println!("duration ms: {:?}", record.duration_ms);
             } else {
-                let job = store.find_job(&args.target)?;
-                println!("{}", job_summary(&job));
-                println!("label: {}", job.label);
-                println!("cwd: {}", job.cwd.display());
-                println!("stdout: {}", job.stdout_path.display());
-                println!("stderr: {}", job.stderr_path.display());
-                println!("plist: {}", job.plist_path.display());
-                println!("keep alive: {}", job.keep_alive);
-                if let Ok(runtime) = jobs::status::resolve_runtime_status(&job).await {
-                    let _ = jobs::sync_job_runtime_status(&store, &job, &runtime);
-                    println!("runtime: {}", runtime.status.as_str());
-                    if let Some(pid) = runtime.pid {
-                        println!("pid: {pid}");
+                let mut job = store.find_job(&args.target)?;
+                let runtime = match jobs::status::resolve_runtime_status(&job).await {
+                    Ok(runtime) => {
+                        job = jobs::sync_job_runtime_status(&store, &job, &runtime).unwrap_or(job);
+                        Some(runtime)
                     }
-                    if let Some(cpu) = runtime.cpu_percent {
-                        println!("cpu percent: {cpu:.1}");
-                    }
-                    if let Some(rss) = runtime.rss_kb {
-                        println!("rss kb: {rss}");
-                    }
-                    if let Some(code) = runtime.last_exit_code {
-                        println!("last exit code: {code}");
-                    }
-                    if let Some(restarts) = runtime.restart_count {
-                        println!("restart count: {restarts}");
-                    }
+                    Err(_) => None,
+                };
+                if args.json {
+                    println!(
+                        "{}",
+                        serde_json::to_string(&inspect::job_payload(job, runtime))?
+                    );
+                } else {
+                    print!("{}", inspect::format_job_inspect(&job, runtime.as_ref()));
                 }
             }
         }
         Commands::Status(args) => {
             let job = store.find_job(&args.job)?;
-            let (synced_job, runtime) = resolve_and_sync_job_runtime(&store, job).await;
-            println!("{} {}", job_summary(&synced_job), runtime_suffix(&runtime));
+            let (synced_job, runtime) =
+                crate::job_cli::resolve_and_sync_job_runtime(&store, job).await;
+            println!(
+                "{} {}",
+                job_summary(&synced_job),
+                crate::job_cli::runtime_suffix(&runtime)
+            );
             println!("label: {}", synced_job.label);
             println!("stdout: {}", synced_job.stdout_path.display());
             println!("stderr: {}", synced_job.stderr_path.display());
@@ -537,20 +543,14 @@ pub async fn run() -> Result<()> {
                 }
             }
         },
+        Commands::Config(args) => {
+            crate::config_cli::handle_config_command(&paths, config, args)?;
+        }
+        Commands::Completion(args) => {
+            crate::completion::handle_completion_command(&store, args)?;
+        }
     }
     Ok(())
-}
-
-async fn resolve_and_sync_job_runtime(
-    store: &Store,
-    job: JobRecord,
-) -> (JobRecord, RuntimeJobStatus) {
-    let runtime = jobs::status::resolve_runtime_status(&job)
-        .await
-        .unwrap_or_else(|_| RuntimeJobStatus::unknown());
-    let synced_job =
-        jobs::sync_job_runtime_status(store, &job, &runtime).unwrap_or_else(|_| job.clone());
-    (synced_job, runtime)
 }
 
 fn write_history_output(output: &str, use_pager: bool) -> Result<()> {
@@ -621,148 +621,49 @@ fn ensure_bulk_delete_confirmed(yes: bool, operation: &str) -> Result<()> {
     )))
 }
 
-async fn monitor_job(store: &Store, args: JobMonitorArgs) -> Result<()> {
-    let interval = Duration::from_secs(args.interval_secs.max(1));
-    let rss_alert_kb = args.rss_alert_mb.map(|mb| mb.saturating_mul(1024));
-    loop {
-        let job = store.find_job(&args.job)?;
-        let (synced_job, runtime) = resolve_and_sync_job_runtime(store, job).await;
-        let alert_count = jobs::record_resource_alerts(
-            store,
-            &synced_job,
-            &runtime,
-            args.cpu_alert,
-            rss_alert_kb,
-        )?;
-        println!(
-            "{} {} alerts={alert_count}",
-            job_summary(&synced_job),
-            runtime_suffix(&runtime)
-        );
-        if args.once {
-            return Ok(());
-        }
-        tokio::time::sleep(interval).await;
-    }
-}
-
-async fn print_job_events(store: &Store, args: JobEventsArgs) -> Result<()> {
-    let job = store.find_job(&args.job)?;
-    let mut after_id = None;
-    for event in store.list_job_events(&job.id, args.limit)? {
-        after_id = Some(after_id.map_or(event.id, |current: i64| current.max(event.id)));
-        println!("{}", format_job_event(&event));
-    }
-    if !args.follow {
+fn ensure_import_confirmed(yes: bool, preview: &ImportPreview) -> Result<()> {
+    if preview.would_import == 0 || yes {
         return Ok(());
     }
-
-    let interval = Duration::from_secs(args.interval_secs.max(1));
-    loop {
-        tokio::time::sleep(interval).await;
-        for event in store.list_job_events_after(&job.id, after_id, args.limit)? {
-            after_id = Some(after_id.map_or(event.id, |current: i64| current.max(event.id)));
-            println!("{}", format_job_event(&event));
-        }
+    if !io::stdin().is_terminal() {
+        return Err(crate::StillrunError::invalid(
+            "import-history requires confirmation; rerun with --yes after reviewing the preview",
+        ));
+    }
+    if prompt_yes_no("Import these shell history entries into Stillrun? [y/N] ")? {
+        Ok(())
+    } else {
+        Err(crate::StillrunError::invalid("import-history cancelled"))
     }
 }
 
-fn format_job_sample(sample: &crate::db::JobResourceSample) -> String {
-    let pid = sample
-        .pid
-        .map(|pid| format!(" pid={pid}"))
-        .unwrap_or_default();
-    let cpu = sample
-        .cpu_percent
-        .map(|cpu| format!(" cpu={cpu:.1}%"))
-        .unwrap_or_default();
-    let rss = sample
-        .rss_kb
-        .map(|rss| format!(" rss={rss}kb"))
-        .unwrap_or_default();
-    let exit = sample
-        .last_exit_code
-        .map(|code| format!(" exit={code}"))
-        .unwrap_or_default();
-    let restarts = sample
-        .restart_count
-        .map(|count| format!(" restarts={count}"))
-        .unwrap_or_default();
-    format!(
-        "#{} job={} sampled_at={} status={}{}{}{}{}{}",
-        sample.id,
-        sample.job_id,
-        sample.sampled_at_ms,
-        sample.status.as_str(),
-        pid,
-        cpu,
-        rss,
-        exit,
-        restarts
-    )
+fn requires_replay_confirmation(record: &crate::db::ExecutionRecord) -> bool {
+    record.status == ExecutionStatus::Imported || record.source.starts_with("shell:")
 }
 
-fn format_job_event(event: &crate::db::JobEventRecord) -> String {
-    let status = event
-        .status
-        .map(|status| format!(" status={}", status.as_str()))
-        .unwrap_or_default();
-    let pid = event
-        .pid
-        .map(|pid| format!(" pid={pid}"))
-        .unwrap_or_default();
-    let cpu = event
-        .cpu_percent
-        .map(|cpu| format!(" cpu={cpu:.1}%"))
-        .unwrap_or_default();
-    let rss = event
-        .rss_kb
-        .map(|rss| format!(" rss={rss}kb"))
-        .unwrap_or_default();
-    format!(
-        "#{} job={} at={} type={}{}{}{}{} {}",
-        event.id,
-        event.job_id,
-        event.created_at_ms,
-        event.event_type,
-        status,
-        pid,
-        cpu,
-        rss,
-        event.message
-    )
+fn ensure_replay_confirmed(yes: bool, record: &crate::db::ExecutionRecord) -> Result<()> {
+    if yes {
+        return Ok(());
+    }
+    if !io::stdin().is_terminal() {
+        return Err(crate::StillrunError::invalid(
+            "replay of imported history requires confirmation; rerun with --preview or --yes",
+        ));
+    }
+    eprint!("{}", inspect::format_replay_preview(record));
+    if prompt_yes_no("Replay this imported history command? [y/N] ")? {
+        Ok(())
+    } else {
+        Err(crate::StillrunError::invalid("replay cancelled"))
+    }
 }
 
-fn runtime_suffix(runtime: &RuntimeJobStatus) -> String {
-    let pid = runtime
-        .pid
-        .map(|pid| format!(" pid={pid}"))
-        .unwrap_or_default();
-    let cpu = runtime
-        .cpu_percent
-        .map(|value| format!(" cpu={value:.1}%"))
-        .unwrap_or_default();
-    let rss = runtime
-        .rss_kb
-        .map(|value| format!(" rss={}kb", value))
-        .unwrap_or_default();
-    let exit = runtime
-        .last_exit_code
-        .map(|code| format!(" exit={code}"))
-        .unwrap_or_default();
-    let restarts = runtime
-        .restart_count
-        .map(|value| format!(" restarts={value}"))
-        .unwrap_or_default();
-    format!(
-        "runtime={}{}{}{}{}{}",
-        runtime.status.as_str(),
-        pid,
-        cpu,
-        rss,
-        exit,
-        restarts
-    )
+fn prompt_yes_no(prompt: &str) -> Result<bool> {
+    eprint!("{prompt}");
+    io::stderr().flush()?;
+    let mut answer = String::new();
+    io::stdin().read_line(&mut answer)?;
+    Ok(matches!(answer.trim(), "y" | "Y" | "yes" | "YES" | "Yes"))
 }
 
 fn write_command_output(stdout: &str, stderr: &str) -> Result<()> {

@@ -7,6 +7,7 @@ use std::{
 
 use clap::ValueEnum;
 use encoding_rs::{GB18030, GBK};
+use serde::{Deserialize, Serialize};
 
 use crate::{
     context::CommandContext,
@@ -15,7 +16,7 @@ use crate::{
     Result,
 };
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ValueEnum)]
 pub enum ShellKind {
     Zsh,
     Bash,
@@ -40,7 +41,7 @@ impl ShellKind {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ValueEnum)]
 pub enum ImportShellSelection {
     Auto,
     Zsh,
@@ -60,6 +61,35 @@ pub struct ImportSummary {
     pub imported: usize,
     pub skipped: usize,
     pub scanned: usize,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ImportPreview {
+    pub files: Vec<ImportFilePreview>,
+    pub scanned: usize,
+    pub would_import: usize,
+    pub duplicates: usize,
+    pub empty: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ImportFilePreview {
+    pub kind: ShellKind,
+    pub path: PathBuf,
+    pub scanned: usize,
+    pub would_import: usize,
+    pub duplicates: usize,
+    pub empty: usize,
+}
+
+impl ImportPreview {
+    fn push_file(&mut self, file: ImportFilePreview) {
+        self.scanned += file.scanned;
+        self.would_import += file.would_import;
+        self.duplicates += file.duplicates;
+        self.empty += file.empty;
+        self.files.push(file);
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -151,6 +181,66 @@ pub fn import_selected_shell_history(
     import_selected_shell_history_with_progress(store, selection, file, &mut progress)
 }
 
+pub fn preview_selected_shell_history(
+    store: &Store,
+    selection: ImportShellSelection,
+    file: Option<PathBuf>,
+) -> Result<ImportPreview> {
+    match (selection, file) {
+        (ImportShellSelection::Auto, None) => preview_shell_history_auto(store),
+        (ImportShellSelection::Auto, Some(path)) => {
+            let kind = ShellKind::from_path_hint(&path).unwrap_or(ShellKind::Zsh);
+            preview_shell_history_file(store, &path, kind, &user_home())
+        }
+        (ImportShellSelection::Zsh, file) => preview_shell_history_file(
+            store,
+            &history_file(file, ShellKind::Zsh),
+            ShellKind::Zsh,
+            &user_home(),
+        ),
+        (ImportShellSelection::Bash, file) => preview_shell_history_file(
+            store,
+            &history_file(file, ShellKind::Bash),
+            ShellKind::Bash,
+            &user_home(),
+        ),
+        (ImportShellSelection::Fish, file) => preview_shell_history_file(
+            store,
+            &history_file(file, ShellKind::Fish),
+            ShellKind::Fish,
+            &user_home(),
+        ),
+    }
+}
+
+pub fn preview_shell_history_auto(store: &Store) -> Result<ImportPreview> {
+    let home = user_home();
+    let mut preview = ImportPreview::default();
+    for (kind, path) in default_history_files(&home) {
+        if !path.exists() {
+            continue;
+        }
+        preview.push_file(preview_shell_history_file_entry(store, &path, kind, &home)?);
+    }
+    Ok(preview)
+}
+
+pub fn preview_shell_history_file(
+    store: &Store,
+    path: &Path,
+    kind: ShellKind,
+    _fallback_cwd: &Path,
+) -> Result<ImportPreview> {
+    let mut preview = ImportPreview::default();
+    preview.push_file(preview_shell_history_file_entry(
+        store,
+        path,
+        kind,
+        _fallback_cwd,
+    )?);
+    Ok(preview)
+}
+
 pub fn import_selected_shell_history_with_progress(
     store: &Store,
     selection: ImportShellSelection,
@@ -208,7 +298,7 @@ pub fn import_shell_history_file_with_progress(
 ) -> Result<ImportSummary> {
     let bytes = fs::read(path)?;
     let text = decode_shell_history_bytes(&bytes, kind);
-    let source = format!("shell:{}:{}", kind.as_str(), path.display());
+    let source = shell_history_source(kind, path);
     let entries = match kind {
         ShellKind::Zsh => parse_zsh_history(&text),
         ShellKind::Bash => parse_bash_history(&text),
@@ -377,6 +467,68 @@ pub fn format_import_progress(snapshot: &ImportProgressSnapshot) -> String {
     )
 }
 
+pub fn format_import_preview(preview: &ImportPreview) -> String {
+    let mut output = String::new();
+    output.push_str(&format!(
+        "Import preview: files={} scanned={} would_import={} duplicates={} empty={}\n",
+        preview.files.len(),
+        preview.scanned,
+        preview.would_import,
+        preview.duplicates,
+        preview.empty
+    ));
+    for file in &preview.files {
+        output.push_str(&format!(
+            "  {} {} scanned={} would_import={} duplicates={} empty={}\n",
+            file.kind.as_str(),
+            file.path.display(),
+            file.scanned,
+            file.would_import,
+            file.duplicates,
+            file.empty
+        ));
+    }
+    output
+}
+
+fn preview_shell_history_file_entry(
+    store: &Store,
+    path: &Path,
+    kind: ShellKind,
+    _fallback_cwd: &Path,
+) -> Result<ImportFilePreview> {
+    let bytes = fs::read(path)?;
+    let text = decode_shell_history_bytes(&bytes, kind);
+    let source = shell_history_source(kind, path);
+    let entries = match kind {
+        ShellKind::Zsh => parse_zsh_history(&text),
+        ShellKind::Bash => parse_bash_history(&text),
+        ShellKind::Fish => parse_fish_history(&text),
+    };
+    let mut file = ImportFilePreview {
+        kind,
+        path: path.to_path_buf(),
+        scanned: entries.len(),
+        would_import: 0,
+        duplicates: 0,
+        empty: 0,
+    };
+    for entry in entries {
+        let command = entry.command.trim();
+        if command.is_empty() {
+            file.empty += 1;
+            continue;
+        }
+        let source_id = entry.line_number.to_string();
+        if store.execution_source_id_exists(&source, &source_id)? {
+            file.duplicates += 1;
+        } else {
+            file.would_import += 1;
+        }
+    }
+    Ok(file)
+}
+
 fn report_import_progress(
     progress: &mut dyn ImportProgressReporter,
     kind: ShellKind,
@@ -535,6 +687,10 @@ fn history_file(file: Option<PathBuf>, kind: ShellKind) -> PathBuf {
         .into_iter()
         .find_map(|(candidate, path)| (candidate == kind).then_some(path))
         .unwrap_or_else(|| home.join(".zsh_history"))
+}
+
+fn shell_history_source(kind: ShellKind, path: &Path) -> String {
+    format!("shell:{}:{}", kind.as_str(), path.display())
 }
 
 fn user_home() -> PathBuf {

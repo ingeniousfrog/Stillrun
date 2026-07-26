@@ -2,7 +2,24 @@ use std::fs;
 
 use assert_cmd::Command;
 use predicates::str::{contains, is_empty};
-use stillrun::db::{JobRecord, JobStatus, Store};
+use stillrun::{
+    context::CommandContext,
+    db::{ExecutionStatus, HistoryFilter, JobRecord, JobStatus, NewExecution, Store},
+};
+
+#[test]
+fn cli_short_help_shows_capabilities_and_examples() {
+    Command::cargo_bin("stillrun")
+        .unwrap()
+        .args(["-h"])
+        .assert()
+        .success()
+        .stdout(contains("Capabilities"))
+        .stdout(contains("Examples"))
+        .stdout(contains("Run and record"))
+        .stdout(contains("stillrun run -- npm run dev"))
+        .stdout(contains("stillrun history --query \"npm\" --sort oldest"));
+}
 
 #[test]
 fn cli_run_records_command_and_history_finds_it() {
@@ -172,6 +189,7 @@ fn cli_history_maintenance_commands_delete_clear_and_prune() {
             "zsh",
             "--file",
             history_path.to_str().unwrap(),
+            "--yes",
         ])
         .assert()
         .success();
@@ -230,6 +248,7 @@ fn cli_import_history_makes_shell_history_searchable() {
             "zsh",
             "--file",
             history_path.to_str().unwrap(),
+            "--yes",
         ])
         .assert()
         .success()
@@ -255,11 +274,233 @@ fn cli_import_history_makes_shell_history_searchable() {
             "zsh",
             "--file",
             history_path.to_str().unwrap(),
+            "--yes",
         ])
         .assert()
         .success()
         .stdout(contains("imported=0"))
         .stdout(contains("skipped=1"));
+}
+
+#[test]
+fn cli_import_history_previews_and_requires_confirmation() {
+    let temp = tempfile::tempdir().unwrap();
+    let history_path = temp.path().join("zsh_history");
+    fs::write(&history_path, ": 1700000000:0;npm run preview-import\n").unwrap();
+
+    Command::cargo_bin("stillrun")
+        .unwrap()
+        .env("STILLRUN_HOME", temp.path())
+        .env("HOME", temp.path())
+        .args([
+            "import-history",
+            "--shell",
+            "zsh",
+            "--file",
+            history_path.to_str().unwrap(),
+            "--preview",
+        ])
+        .assert()
+        .success()
+        .stdout(contains("would_import=1"))
+        .stdout(contains("zsh_history"));
+
+    let store = Store::open(temp.path().join("stillrun.db")).unwrap();
+    store.initialize().unwrap();
+    assert!(store
+        .search_history(&HistoryFilter {
+            query: Some("preview-import".into()),
+            limit: 10,
+            ..HistoryFilter::default()
+        })
+        .unwrap()
+        .is_empty());
+
+    Command::cargo_bin("stillrun")
+        .unwrap()
+        .env("STILLRUN_HOME", temp.path())
+        .env("HOME", temp.path())
+        .args([
+            "import-history",
+            "--shell",
+            "zsh",
+            "--file",
+            history_path.to_str().unwrap(),
+        ])
+        .assert()
+        .failure()
+        .stderr(contains("requires confirmation"));
+}
+
+#[test]
+fn cli_replay_imported_history_requires_preview_or_confirmation() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = Store::open(temp.path().join("stillrun.db")).unwrap();
+    store.initialize().unwrap();
+    let id = store
+        .insert_imported_execution(
+            &NewExecution {
+                argv: vec![
+                    "/bin/sh".into(),
+                    "-c".into(),
+                    "printf replay-imported".into(),
+                ],
+                context: CommandContext {
+                    cwd: temp.path().to_path_buf(),
+                    git_repo: None,
+                    git_branch: None,
+                    env: Default::default(),
+                },
+                started_at_ms: 1_700_000_000_000,
+                ended_at_ms: None,
+                duration_ms: None,
+                exit_code: None,
+                status: ExecutionStatus::Imported,
+                stdout: String::new(),
+                stderr: String::new(),
+                pid: None,
+                background_job_id: None,
+                restart_count: 0,
+            },
+            "shell:zsh:/tmp/history",
+            "1",
+            "printf replay-imported",
+        )
+        .unwrap()
+        .unwrap();
+
+    Command::cargo_bin("stillrun")
+        .unwrap()
+        .env("STILLRUN_HOME", temp.path())
+        .args(["replay", &id.to_string(), "--preview"])
+        .assert()
+        .success()
+        .stdout(contains("Replay preview"))
+        .stdout(contains("printf replay-imported"))
+        .stdout(contains("source: shell:zsh:/tmp/history:1"));
+
+    Command::cargo_bin("stillrun")
+        .unwrap()
+        .env("STILLRUN_HOME", temp.path())
+        .args(["replay", &id.to_string()])
+        .assert()
+        .failure()
+        .stderr(contains("requires confirmation"));
+
+    Command::cargo_bin("stillrun")
+        .unwrap()
+        .env("STILLRUN_HOME", temp.path())
+        .args(["replay", &id.to_string(), "--yes"])
+        .assert()
+        .success()
+        .stdout(contains("replay-imported"));
+}
+
+#[test]
+fn cli_history_sort_controls_display_order() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = Store::open(temp.path().join("stillrun.db")).unwrap();
+    store.initialize().unwrap();
+    insert_test_execution(&store, temp.path(), "old-cli", 1_000);
+    insert_test_execution(&store, temp.path(), "new-cli", 2_000);
+
+    let output = Command::cargo_bin("stillrun")
+        .unwrap()
+        .env("STILLRUN_HOME", temp.path())
+        .args(["history", "--sort", "oldest", "--full"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let text = String::from_utf8(output).unwrap();
+
+    assert!(text.find("old-cli").unwrap() < text.find("new-cli").unwrap());
+}
+
+#[test]
+fn cli_inspect_json_outputs_structured_execution_payload() {
+    let temp = tempfile::tempdir().unwrap();
+
+    Command::cargo_bin("stillrun")
+        .unwrap()
+        .env("STILLRUN_HOME", temp.path())
+        .args(["run", "--", "printf", "inspect-json"])
+        .assert()
+        .success();
+
+    Command::cargo_bin("stillrun")
+        .unwrap()
+        .env("STILLRUN_HOME", temp.path())
+        .args(["inspect", "1", "--json"])
+        .assert()
+        .success()
+        .stdout(contains(r#""type":"execution""#))
+        .stdout(contains(r#""command":"printf inspect-json""#));
+}
+
+#[test]
+fn cli_config_manages_persisted_config_file() {
+    let temp = tempfile::tempdir().unwrap();
+
+    Command::cargo_bin("stillrun")
+        .unwrap()
+        .env("STILLRUN_HOME", temp.path())
+        .args(["config", "set", "max-output-bytes", "4096"])
+        .assert()
+        .success()
+        .stdout(contains("max_output_bytes=4096"));
+
+    Command::cargo_bin("stillrun")
+        .unwrap()
+        .env("STILLRUN_HOME", temp.path())
+        .args(["config", "redact", "add", "session_token"])
+        .assert()
+        .success()
+        .stdout(contains("added redact key session_token"));
+
+    Command::cargo_bin("stillrun")
+        .unwrap()
+        .env("STILLRUN_HOME", temp.path())
+        .args(["config", "show", "--json"])
+        .assert()
+        .success()
+        .stdout(contains(r#""max_output_bytes":4096"#))
+        .stdout(contains("session_token"));
+
+    assert!(temp.path().join("config.toml").exists());
+}
+
+#[test]
+fn cli_completion_scripts_and_job_candidates_are_available() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = Store::open(temp.path().join("stillrun.db")).unwrap();
+    store.initialize().unwrap();
+    store.upsert_job(&job_record(temp.path())).unwrap();
+
+    Command::cargo_bin("stillrun")
+        .unwrap()
+        .env("STILLRUN_HOME", temp.path())
+        .args(["completion", "zsh"])
+        .assert()
+        .success()
+        .stdout(contains("completion candidates jobs"));
+
+    Command::cargo_bin("stillrun")
+        .unwrap()
+        .env("STILLRUN_HOME", temp.path())
+        .args(["completion", "candidates", "jobs", "--prefix", "de"])
+        .assert()
+        .success()
+        .stdout(contains("dev"));
+
+    Command::cargo_bin("stillrun")
+        .unwrap()
+        .env("STILLRUN_HOME", temp.path())
+        .args(["completion", "candidates", "jobs"])
+        .assert()
+        .success()
+        .stdout(contains("job-1"));
 }
 
 fn job_record(root: &std::path::Path) -> JobRecord {
@@ -285,4 +526,28 @@ fn job_record(root: &std::path::Path) -> JobRecord {
         last_cpu_percent: None,
         last_rss_kb: None,
     }
+}
+
+fn insert_test_execution(store: &Store, cwd: &std::path::Path, label: &str, started_at_ms: i64) {
+    store
+        .insert_execution(&NewExecution {
+            argv: vec!["echo".into(), label.into()],
+            context: CommandContext {
+                cwd: cwd.to_path_buf(),
+                git_repo: None,
+                git_branch: None,
+                env: Default::default(),
+            },
+            started_at_ms,
+            ended_at_ms: Some(started_at_ms + 1),
+            duration_ms: Some(1),
+            exit_code: Some(0),
+            status: ExecutionStatus::Success,
+            stdout: String::new(),
+            stderr: String::new(),
+            pid: None,
+            background_job_id: None,
+            restart_count: 0,
+        })
+        .unwrap();
 }

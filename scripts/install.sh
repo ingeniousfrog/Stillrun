@@ -16,7 +16,7 @@ read -r answer
 
 case "${answer:-}" in
   y|Y|yes|YES)
-    stillrun import-history --shell auto
+    stillrun import-history --shell auto --yes
     ;;
   *)
     echo "Skipped shell history import. You can run: stillrun import-history --shell auto"
