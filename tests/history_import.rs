@@ -3,9 +3,9 @@ use std::{fs, path::PathBuf};
 use stillrun::{
     db::{ExecutionStatus, HistoryFilter, Store},
     history_import::{
-        decode_history_bytes, format_import_progress, import_shell_history_file,
-        import_shell_history_file_with_progress, parse_fish_history, parse_zsh_history,
-        ImportProgressReporter, ImportProgressSnapshot, ShellKind,
+        decode_history_bytes, decode_shell_history_bytes, format_import_progress,
+        import_shell_history_file, import_shell_history_file_with_progress, parse_fish_history,
+        parse_zsh_history, ImportProgressReporter, ImportProgressSnapshot, ShellKind,
     },
 };
 
@@ -130,6 +130,46 @@ fn decodes_mixed_utf8_and_gb18030_history_by_line() {
     assert!(decoded.contains("UTF8-中文"));
     assert!(decoded.contains("你好 世界"));
     assert!(!decoded.contains("涓"));
+}
+
+#[test]
+fn decodes_zsh_metafied_utf8_history_before_encoding_detection() {
+    let bytes = b": 1700000000:0;echo \"\xe5\xb0\x83\xa6\xe8\x83\xa3\x83\xac\xe6\x83\xb9\xaf\"\n";
+
+    let decoded = decode_shell_history_bytes(bytes, ShellKind::Zsh);
+
+    assert!(decoded.contains("将背景"));
+    assert!(!decoded.contains("胣"));
+    assert!(!decoded.contains('\u{fffd}'));
+}
+
+#[test]
+fn imports_zsh_metafied_utf8_history_as_readable_chinese() {
+    let temp = tempfile::tempdir().unwrap();
+    let history_path = temp.path().join(".zsh_history");
+    fs::write(
+        &history_path,
+        b": 1700000000:0;echo \"\xe5\xb0\x83\xa6\xe8\x83\xa3\x83\xac\xe6\x83\xb9\xaf\"\n",
+    )
+    .unwrap();
+    let store = Store::open(temp.path().join("stillrun.db")).unwrap();
+    store.initialize().unwrap();
+    let home = PathBuf::from("/Users/tester");
+
+    let summary = import_shell_history_file(&store, &history_path, ShellKind::Zsh, &home).unwrap();
+    let matches = store
+        .search_history(&HistoryFilter {
+            status: Some(ExecutionStatus::Imported),
+            limit: 10,
+            ..HistoryFilter::default()
+        })
+        .unwrap();
+
+    assert_eq!(summary.imported, 1);
+    assert_eq!(matches.len(), 1);
+    assert!(matches[0].command.contains("将背景"));
+    assert!(!matches[0].command.contains("胣"));
+    assert!(!matches[0].command.contains('\u{fffd}'));
 }
 
 #[test]

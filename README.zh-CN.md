@@ -55,7 +55,7 @@ stillrun history --query "lxy-1"
 stillrun import-history --shell auto
 ```
 
-Stillrun 会逐行尝试 UTF-8、GB18030/GBK 等常见编码，尽量避免中文命令变成 `�`。
+Stillrun 会逐行处理 zsh history 的原生转义，并尝试 UTF-8、GB18030/GBK 等常见编码，尽量避免中文命令变成乱码或 `�`。
 
 ## 安装
 

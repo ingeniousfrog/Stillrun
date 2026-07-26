@@ -207,7 +207,7 @@ pub fn import_shell_history_file_with_progress(
     progress: &mut dyn ImportProgressReporter,
 ) -> Result<ImportSummary> {
     let bytes = fs::read(path)?;
-    let text = decode_history_bytes(&bytes);
+    let text = decode_shell_history_bytes(&bytes, kind);
     let source = format!("shell:{}:{}", kind.as_str(), path.display());
     let entries = match kind {
         ShellKind::Zsh => parse_zsh_history(&text),
@@ -265,6 +265,13 @@ pub fn import_shell_history_file_with_progress(
     Ok(summary)
 }
 
+pub fn decode_shell_history_bytes(bytes: &[u8], kind: ShellKind) -> String {
+    match kind {
+        ShellKind::Zsh => decode_zsh_history_bytes(bytes),
+        ShellKind::Bash | ShellKind::Fish => decode_history_bytes(bytes),
+    }
+}
+
 pub fn decode_history_bytes(bytes: &[u8]) -> String {
     if bytes.is_empty() {
         return String::new();
@@ -280,6 +287,31 @@ pub fn decode_history_bytes(bytes: &[u8]) -> String {
             .map(|line| (line, "\n"))
             .unwrap_or((chunk, ""));
         decoded.push_str(&decode_history_line(line));
+        decoded.push_str(newline);
+    }
+    decoded
+}
+
+fn decode_zsh_history_bytes(bytes: &[u8]) -> String {
+    if bytes.is_empty() {
+        return String::new();
+    }
+    if let Ok(text) = std::str::from_utf8(bytes) {
+        return text.to_string();
+    }
+
+    let mut decoded = String::new();
+    for chunk in bytes.split_inclusive(|byte| *byte == b'\n') {
+        let (line, newline) = chunk
+            .strip_suffix(b"\n")
+            .map(|line| (line, "\n"))
+            .unwrap_or((chunk, ""));
+        if std::str::from_utf8(line).is_ok() {
+            decoded.push_str(&decode_history_line(line));
+        } else {
+            let unmetafied = unmetafy_zsh_line(line);
+            decoded.push_str(&decode_history_line(&unmetafied));
+        }
         decoded.push_str(newline);
     }
     decoded
@@ -305,6 +337,22 @@ fn decode_history_line(bytes: &[u8]) -> String {
         .min_by_key(|(_text, had_errors, replacement_count)| (*had_errors, *replacement_count))
         .map(|(text, _had_errors, _replacement_count)| text)
         .unwrap_or_else(|| String::from_utf8_lossy(bytes).into_owned())
+}
+
+fn unmetafy_zsh_line(bytes: &[u8]) -> Vec<u8> {
+    const ZSH_META: u8 = 0x83;
+    let mut unmetafied = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == ZSH_META && index + 1 < bytes.len() {
+            unmetafied.push(bytes[index + 1] ^ 0x20);
+            index += 2;
+        } else {
+            unmetafied.push(bytes[index]);
+            index += 1;
+        }
+    }
+    unmetafied
 }
 
 pub fn format_import_progress(snapshot: &ImportProgressSnapshot) -> String {
