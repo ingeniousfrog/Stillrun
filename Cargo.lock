@@ -735,6 +735,7 @@ dependencies = [
  "assert_cmd",
  "clap",
  "encoding_rs",
+ "libc",
  "notify",
  "predicates",
  "regex",

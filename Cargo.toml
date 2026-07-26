@@ -9,6 +9,7 @@ license = "MIT"
 [dependencies]
 clap = { version = "4.5", features = ["derive", "env"] }
 encoding_rs = "0.8"
+libc = "0.2"
 notify = "6.1"
 regex = "1.13"
 rusqlite = { version = "0.32", features = ["bundled", "modern_sqlite"] }

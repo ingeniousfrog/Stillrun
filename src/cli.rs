@@ -581,6 +581,31 @@ fn should_auto_page(record_count: usize) -> bool {
 }
 
 fn terminal_width() -> Option<usize> {
+    terminal_width_from_tty().or_else(terminal_width_from_env)
+}
+
+#[cfg(unix)]
+fn terminal_width_from_tty() -> Option<usize> {
+    let mut size = libc::winsize {
+        ws_row: 0,
+        ws_col: 0,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    let result = unsafe { libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut size) };
+    if result == 0 && size.ws_col >= 60 {
+        Some(size.ws_col as usize)
+    } else {
+        None
+    }
+}
+
+#[cfg(not(unix))]
+fn terminal_width_from_tty() -> Option<usize> {
+    None
+}
+
+fn terminal_width_from_env() -> Option<usize> {
     std::env::var("COLUMNS")
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
