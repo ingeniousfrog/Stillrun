@@ -1,5 +1,8 @@
 /target/
 
+# Local notes and drafts — keep off GitHub.
+/docs/
+
 # Local runtime state used during manual Stillrun experiments.
 /.stillrun/
 *.db

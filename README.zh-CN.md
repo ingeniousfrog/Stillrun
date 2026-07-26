@@ -1,159 +1,209 @@
 # Stillrun
 
-Stillrun 是一个面向 macOS 的命令生命周期运行时。它会记录终端命令，让你可以搜索、检查、重放，并把常用命令提升成 launchd 管理的后台 Job，带日志和状态。
+[English](README.md) | 简体中文
 
-## 安装
+面向 macOS 的 CLI：**命令历史**、**安全重放**、以及 **launchd 管理的后台 Job**。
 
-```sh
+---
+
+## 概述
+
+Stillrun 把终端命令变成可搜索、可检查的记录。常用命令可以提升成带日志、状态和资源采样的后台 Job——而不取代你现有的 shell。
+
+**主要场景：** 可找回的命令历史、一次性或常驻后台任务、本地 Job 可观测性。
+
+**不在范围内：** TUI / Web UI、AI 搜索、远程节点、Linux / Windows 后台后端（MVP 仅 macOS + launchd）。
+
+敏感信息在落库前会脱敏。Replay 只恢复记录里的非敏感环境，不会带上你当前 shell 的环境。
+
+---
+
+## 功能
+
+| 能力 | 命令 | 说明 |
+| --- | --- | --- |
+| 运行并记录 | `run` | 捕获 argv、cwd、Git、耗时、退出码、stdout/stderr、脱敏后的环境 |
+| 历史 | `history` | FTS5 + 子串 fallback 搜索；过滤、排序、裁剪、清理 |
+| 导入 | `import-history` | 预览 / 导入本机 zsh、bash、fish history |
+| 重放 | `replay` | 按原 cwd 与记录的非敏感环境重跑 |
+| 提升 | `promote` | 把历史执行变成 launchd Job |
+| Job | `jobs`、`status`、`start`、`stop`、`restart` | 生命周期、仪表盘、采样、事件 |
+| 日志 | `logs` | 查看或跟随 Job 的 stdout/stderr |
+| 检查 | `inspect` | 文本或 JSON 查看 execution / Job |
+| 配置 | `config` | 本地 TOML 与脱敏关键字管理 |
+| Shell 集成 | `hook`、`completion` | 自动记录后续 shell 命令；补全脚本 |
+
+---
+
+## 快速开始
+
+```bash
 ./scripts/install.sh
-```
-
-安装脚本会执行 `cargo install --path . --force`。如果你同意，它还会导入本机 shell history，并安装 shell hook。
-
-非交互安装：
-
-```sh
+# 或非交互安装：
 cargo install --path .
 ```
 
-## 快速帮助
+验证：
 
-```sh
+```bash
 stillrun -h
-stillrun <command> -h
+stillrun run -- printf 'hello stillrun\n'
+stillrun history --query hello
 ```
 
-`stillrun -h` 会直接展示能力列表和简短示例；子命令帮助用于查看某个工作流的具体参数。
+安装脚本在你确认后，可导入本机 shell history，并安装 shell hook。
 
-## 能力列表
+---
 
-| 能力 | 命令 | 示例 |
-| --- | --- | --- |
-| 运行并记录 | `run` | `stillrun run -- npm run dev` |
-| 搜索历史 | `history` | `stillrun history --query "npm" --sort oldest` |
-| 导入 shell history | `import-history` | `stillrun import-history --shell auto --preview` |
-| 安全重放 | `replay` | `stillrun replay 12 --preview` |
-| 提升为 Job | `promote` | `stillrun promote 12 --name dev-server` |
-| 管理 Job | `jobs`、`status`、`start`、`stop`、`restart` | `stillrun status dev-server` |
-| 查看日志 | `logs` | `stillrun logs dev-server --follow` |
-| 检查元数据 | `inspect` | `stillrun inspect 12 --json` |
-| 管理配置 | `config` | `stillrun config set max-output-bytes 2097152` |
-| shell hook | `hook` | `stillrun hook install --shell auto` |
-| shell completion | `completion` | `stillrun completion zsh > ~/.stillrun-completion.zsh` |
+## 工作流
 
-## 常用示例
-
-运行并记录前台命令：
-
-```sh
-stillrun run -- npm run dev
-stillrun run -- zsh -lc "curl -s https://example.com | jq ."
+```mermaid
+flowchart LR
+  subgraph capture [捕获]
+    R[run]
+    H[hook]
+    I[import-history]
+  end
+  subgraph store [存储]
+    DB[(SQLite + FTS5)]
+  end
+  subgraph reuse [复用]
+    S[history / inspect]
+    P[replay]
+    J[promote / jobs]
+  end
+  R --> DB
+  H --> DB
+  I --> DB
+  DB --> S
+  DB --> P
+  DB --> J
+  J --> L[launchd + logs]
 ```
 
-搜索和检查历史：
+**常见路径：** 记录 → 搜索 → 重放或提升 → 管理 Job 生命周期。
 
-```sh
-stillrun history --query "npm"
-stillrun history --query "咖啡厅"
-stillrun history --status success
-stillrun history --status imported --query "cargo"
-stillrun history --since-ms 1720000000000 --until-ms 1730000000000
-stillrun history --sort oldest --full --details
+```mermaid
+sequenceDiagram
+  participant U as 用户
+  participant S as stillrun
+  participant L as launchd
+  U->>S: run -- printf hello
+  S-->>U: 记录 execution #1
+  U->>S: history --query hello
+  U->>S: run --background --name demo -- sleep 30
+  S->>L: bootstrap plist
+  U->>S: status demo / logs demo
+  U->>S: stop demo
+```
+
+---
+
+## 安装
+
+**当前版本：** `0.1.0`（源码安装）
+
+| 方式 | 命令 |
+| --- | --- |
+| 交互安装 | `./scripts/install.sh` |
+| 非交互安装 | `cargo install --path .` |
+| 开发态 | `cargo run -- <args>` |
+
+需要 Rust **1.78+**，以及 macOS（后台 Job 依赖 launchd）。
+
+实验时可用独立数据目录：
+
+```bash
+export STILLRUN_HOME=/tmp/stillrun-dev
+stillrun run -- printf 'isolated\n'
+stillrun history
+```
+
+---
+
+## 示例
+
+```bash
+# 记录前台命令
+stillrun run -- printf 'hello stillrun\n'
+stillrun run -- zsh -lc 'curl -s https://example.com | head -c 80'
+
+# 搜索 / 检查
+stillrun history --query hello
+stillrun history --status success --sort oldest
+stillrun inspect 1
 stillrun inspect 1 --json
-```
 
-先预览，再导入本机 shell history：
-
-```sh
+# 导入 shell history（先预览）
 stillrun import-history --shell auto --preview
-stillrun import-history --shell auto
-stillrun import-history --shell zsh --file ~/.zsh_history --yes
-```
+stillrun import-history --shell auto --yes
 
-重放命令：
-
-```sh
+# 重放
 stillrun replay 1 --preview
 stillrun replay 1 --yes
-```
 
-创建和管理后台 Job：
-
-```sh
-stillrun run --background --name dev-server -- npm run dev
-stillrun run --background --keep-alive --name api-server -- cargo run
+# 后台 Job
+stillrun run --background --name demo-tick -- zsh -lc 'for i in 1 2 3; do echo tick-$i; sleep 1; done'
 stillrun jobs
-stillrun status dev-server
-stillrun logs dev-server --follow
-stillrun jobs monitor dev-server --once --cpu-alert 90 --rss-alert-mb 1024
-stillrun stop dev-server
-stillrun start dev-server
-stillrun restart dev-server
-stillrun jobs delete dev-server
-```
+stillrun status demo-tick
+stillrun logs demo-tick
+stillrun jobs monitor demo-tick --once
+stillrun stop demo-tick
+stillrun jobs delete demo-tick
 
-把历史命令提升成后台 Job：
-
-```sh
-stillrun run -- python scripts/download.py
-stillrun history --query download.py
-stillrun promote 1 --name downloader
-stillrun logs downloader --follow
-```
-
-管理配置：
-
-```sh
+# 配置与 shell 辅助
 stillrun config show
-stillrun config show --json
-stillrun config path
-stillrun config set max-output-bytes 2097152
-stillrun config redact add session_token
-stillrun config redact list
-```
-
-安装辅助功能：
-
-```sh
 stillrun hook install --shell auto
-stillrun hook print --shell zsh
 stillrun completion zsh > ~/.stillrun-completion.zsh
-printf '\nsource ~/.stillrun-completion.zsh\n' >> ~/.zshrc
 ```
 
-## 存储位置
+---
 
-Stillrun 的本地状态默认写在：
+## 存储
+
+默认路径：
 
 ```text
 ~/Library/Application Support/Stillrun/stillrun.db
 ~/Library/Application Support/Stillrun/logs/
 ~/Library/Application Support/Stillrun/config.toml
+~/Library/LaunchAgents/com.stillrun.*.plist
 ```
 
-后台 Job 的 plist 默认写入 `~/Library/LaunchAgents/`。
+| 变量 | 作用 |
+| --- | --- |
+| `STILLRUN_HOME` | 覆盖 Stillrun 数据目录 |
+| `STILLRUN_LAUNCH_AGENTS_DIR` | 覆盖 plist 目录（测试 / 实验） |
 
-开发或测试时可以用 `STILLRUN_HOME` 隔离状态：
+---
 
-```sh
-STILLRUN_HOME=/tmp/stillrun-dev cargo run -- history
-```
+## 安全
 
-## 安全说明
+Stillrun 写入 SQLite 前会脱敏常见 secret：环境变量名如 `token` / `password` / `api_key`，以及 `Authorization: Bearer ...`、`token=...`、`--token value` 等内联模式。
 
-Stillrun 写入 SQLite 前会脱敏常见敏感环境变量和命令/输出里的 secret 模式，包括 token、password、secret、API key、`Authorization: Bearer ...`、`token=...`、`--token value`、`--password=value` 等。
+- **Replay** 会清空当前进程环境，再恢复记录中的非脱敏值。
+- **导入** 的历史在 replay 前需要 `--preview` 或 `--yes`。
+- **Shell hook** 记录命令文本、cwd、Git 信息和退出码，不捕获 stdout/stderr。需要完整输出时请用 `stillrun run` 或后台 Job。
 
-Replay 会清空当前进程环境，再恢复记录里的非敏感环境变量。从 shell history 导入的命令在 replay 前会要求 preview 或确认，避免误重放旧命令。
+---
 
-## 测试
+## 开发
 
-```sh
-cargo test
+```bash
+cargo fmt --all --check
 cargo clippy --all-targets -- -D warnings
+cargo test
+cargo build --release
 ```
 
-真实 macOS launchd 生命周期 E2E 需要显式打开开关，因为它会短暂触碰用户 launchd 会话：
+真实 launchd 生命周期 E2E（会触碰用户 launchd 会话）：
 
-```sh
+```bash
 STILLRUN_RUN_LAUNCHD_E2E=1 cargo test --test launchd_e2e -- --nocapture
 ```
+
+---
+
+## 许可证
+
+MIT — 见 [`LICENSE`](LICENSE)。
