@@ -31,7 +31,7 @@ impl ShellKind {
         }
     }
 
-    fn replay_argv(self, command: &str) -> Vec<String> {
+    pub fn replay_argv(self, command: &str) -> Vec<String> {
         match self {
             Self::Zsh => vec!["zsh".into(), "-lc".into(), command.into()],
             Self::Bash => vec!["bash".into(), "-lc".into(), command.into()],

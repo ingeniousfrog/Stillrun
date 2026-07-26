@@ -9,7 +9,8 @@ use crate::{
     config::StillrunConfig,
     context::CommandContext,
     db::{
-        format_argv, ExecutionStatus, JobRecord, JobRuntimeUpdate, JobStatus, NewExecution, Store,
+        format_argv, ExecutionStatus, JobRecord, JobRuntimeUpdate, JobStatus, NewExecution,
+        NewJobEvent, NewJobResourceSample, Store,
     },
     execution::now_ms,
     jobs::launchd::LaunchdJobSpec,
@@ -97,6 +98,7 @@ pub async fn create_background_job(
         last_rss_kb: None,
     };
     store.upsert_job(&created)?;
+    record_job_lifecycle_event(store, &created, "created", "job created")?;
     store.insert_execution(&NewExecution {
         argv: created.argv.clone(),
         context,
@@ -119,6 +121,7 @@ pub async fn create_background_job(
         ..created
     };
     store.upsert_job(&running)?;
+    record_job_lifecycle_event(store, &running, "started", "job started")?;
     Ok(running)
 }
 
@@ -171,6 +174,7 @@ pub async fn stop_job(store: &Store, target: &str) -> Result<JobRecord> {
         ..job
     };
     store.upsert_job(&stopped)?;
+    record_job_lifecycle_event(store, &stopped, "stopped", "job stopped")?;
     Ok(stopped)
 }
 
@@ -195,6 +199,7 @@ pub async fn start_job(store: &Store, target: &str) -> Result<JobRecord> {
         ..job
     };
     store.upsert_job(&running)?;
+    record_job_lifecycle_event(store, &running, "started", "job started")?;
     Ok(running)
 }
 
@@ -219,7 +224,22 @@ pub async fn restart_job(store: &Store, target: &str) -> Result<JobRecord> {
         ..job
     };
     store.upsert_job(&running)?;
+    record_job_lifecycle_event(store, &running, "restarted", "job restarted")?;
     Ok(running)
+}
+
+pub async fn delete_job(store: &Store, target: &str, keep_plist: bool) -> Result<JobRecord> {
+    let job = store.find_job(target)?;
+    if cfg!(target_os = "macos") {
+        if let Err(err) = bootout_job(&job).await {
+            tracing::warn!(job = %job.id, error = %err, "failed to unload launchd job before delete");
+        }
+    }
+    if !keep_plist && job.plist_path.exists() {
+        std::fs::remove_file(&job.plist_path)?;
+    }
+    store.delete_job_record(&job.id)?;
+    Ok(job)
 }
 
 pub fn sync_job_runtime_status(
@@ -227,6 +247,18 @@ pub fn sync_job_runtime_status(
     job: &JobRecord,
     runtime: &status::RuntimeJobStatus,
 ) -> Result<JobRecord> {
+    let observed_at_ms = now_ms();
+    store.record_job_resource_sample(&NewJobResourceSample {
+        job_id: job.id.clone(),
+        sampled_at_ms: observed_at_ms,
+        status: runtime.status,
+        pid: runtime.pid,
+        last_exit_code: runtime.last_exit_code,
+        cpu_percent: runtime.cpu_percent,
+        rss_kb: runtime.rss_kb,
+        restart_count: runtime.restart_count,
+    })?;
+    record_runtime_change_events(store, job, runtime, observed_at_ms)?;
     store.update_job_runtime(
         &job.id,
         &JobRuntimeUpdate {
@@ -236,9 +268,149 @@ pub fn sync_job_runtime_status(
             cpu_percent: runtime.cpu_percent,
             rss_kb: runtime.rss_kb,
             restart_count: runtime.restart_count,
-            updated_at_ms: now_ms(),
+            updated_at_ms: observed_at_ms,
         },
     )
+}
+
+pub fn record_resource_alerts(
+    store: &Store,
+    job: &JobRecord,
+    runtime: &status::RuntimeJobStatus,
+    cpu_alert_percent: Option<f32>,
+    rss_alert_kb: Option<u64>,
+) -> Result<usize> {
+    let created_at_ms = now_ms();
+    let mut recorded = 0;
+    if let (Some(cpu), Some(threshold)) = (runtime.cpu_percent, cpu_alert_percent) {
+        if cpu >= threshold {
+            store.record_job_event(&NewJobEvent {
+                job_id: job.id.clone(),
+                created_at_ms,
+                event_type: "alert.cpu".into(),
+                message: format!("cpu {cpu:.1}% >= {threshold:.1}%"),
+                status: Some(runtime.status),
+                pid: runtime.pid,
+                last_exit_code: runtime.last_exit_code,
+                cpu_percent: runtime.cpu_percent,
+                rss_kb: runtime.rss_kb,
+            })?;
+            recorded += 1;
+        }
+    }
+    if let (Some(rss), Some(threshold)) = (runtime.rss_kb, rss_alert_kb) {
+        if rss >= threshold {
+            store.record_job_event(&NewJobEvent {
+                job_id: job.id.clone(),
+                created_at_ms,
+                event_type: "alert.rss".into(),
+                message: format!("rss {rss}kb >= {threshold}kb"),
+                status: Some(runtime.status),
+                pid: runtime.pid,
+                last_exit_code: runtime.last_exit_code,
+                cpu_percent: runtime.cpu_percent,
+                rss_kb: runtime.rss_kb,
+            })?;
+            recorded += 1;
+        }
+    }
+    Ok(recorded)
+}
+
+fn record_job_lifecycle_event(
+    store: &Store,
+    job: &JobRecord,
+    event_type: &str,
+    message: &str,
+) -> Result<()> {
+    store.record_job_event(&NewJobEvent {
+        job_id: job.id.clone(),
+        created_at_ms: job.updated_at_ms,
+        event_type: event_type.into(),
+        message: message.into(),
+        status: Some(job.status),
+        pid: job.pid,
+        last_exit_code: job.last_exit_code,
+        cpu_percent: job.last_cpu_percent,
+        rss_kb: job.last_rss_kb,
+    })?;
+    Ok(())
+}
+
+fn record_runtime_change_events(
+    store: &Store,
+    job: &JobRecord,
+    runtime: &status::RuntimeJobStatus,
+    observed_at_ms: i64,
+) -> Result<()> {
+    if job.status != runtime.status {
+        store.record_job_event(&runtime_event(
+            job,
+            runtime,
+            observed_at_ms,
+            "status",
+            format!(
+                "status {} -> {}",
+                job.status.as_str(),
+                runtime.status.as_str()
+            ),
+        ))?;
+    }
+    if job.pid != runtime.pid {
+        store.record_job_event(&runtime_event(
+            job,
+            runtime,
+            observed_at_ms,
+            "pid",
+            format!("pid {:?} -> {:?}", job.pid, runtime.pid),
+        ))?;
+    }
+    if runtime.last_exit_code.is_some() && job.last_exit_code != runtime.last_exit_code {
+        store.record_job_event(&runtime_event(
+            job,
+            runtime,
+            observed_at_ms,
+            "exit",
+            format!("exit code -> {:?}", runtime.last_exit_code),
+        ))?;
+    }
+    if runtime
+        .restart_count
+        .is_some_and(|restart_count| restart_count > job.restart_count)
+    {
+        store.record_job_event(&runtime_event(
+            job,
+            runtime,
+            observed_at_ms,
+            "restart",
+            format!(
+                "restart count {} -> {}",
+                job.restart_count,
+                runtime.restart_count.unwrap_or(job.restart_count)
+            ),
+        ))?;
+    }
+    Ok(())
+}
+
+fn runtime_event(
+    job: &JobRecord,
+    runtime: &status::RuntimeJobStatus,
+    created_at_ms: i64,
+    event_type: &str,
+    message: String,
+) -> NewJobEvent {
+    NewJobEvent {
+        job_id: job.id.clone(),
+        created_at_ms,
+        event_type: event_type.into(),
+        message,
+        status: Some(runtime.status),
+        pid: runtime.pid,
+        last_exit_code: runtime.last_exit_code,
+        cpu_percent: runtime.cpu_percent,
+        rss_kb: runtime.rss_kb,
+    }
 }
 
 async fn bootstrap_job(job: &JobRecord) -> Result<()> {

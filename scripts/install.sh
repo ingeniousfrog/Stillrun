@@ -22,3 +22,15 @@ case "${answer:-}" in
     echo "Skipped shell history import. You can run: stillrun import-history --shell auto"
     ;;
 esac
+
+printf "是否安装 Stillrun shell hook，以便未来命令自动记录 cwd/Git/退出码？[y/N] "
+read -r hook_answer
+
+case "${hook_answer:-}" in
+  y|Y|yes|YES)
+    stillrun hook install --shell auto
+    ;;
+  *)
+    echo "Skipped shell hook install. You can run: stillrun hook install --shell auto"
+    ;;
+esac

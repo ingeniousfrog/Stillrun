@@ -128,6 +128,58 @@ pub struct JobRuntimeUpdate {
     pub updated_at_ms: i64,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct NewJobResourceSample {
+    pub job_id: String,
+    pub sampled_at_ms: i64,
+    pub status: JobStatus,
+    pub pid: Option<u32>,
+    pub last_exit_code: Option<i32>,
+    pub cpu_percent: Option<f32>,
+    pub rss_kb: Option<u64>,
+    pub restart_count: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct JobResourceSample {
+    pub id: i64,
+    pub job_id: String,
+    pub sampled_at_ms: i64,
+    pub status: JobStatus,
+    pub pid: Option<u32>,
+    pub last_exit_code: Option<i32>,
+    pub cpu_percent: Option<f32>,
+    pub rss_kb: Option<u64>,
+    pub restart_count: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct NewJobEvent {
+    pub job_id: String,
+    pub created_at_ms: i64,
+    pub event_type: String,
+    pub message: String,
+    pub status: Option<JobStatus>,
+    pub pid: Option<u32>,
+    pub last_exit_code: Option<i32>,
+    pub cpu_percent: Option<f32>,
+    pub rss_kb: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct JobEventRecord {
+    pub id: i64,
+    pub job_id: String,
+    pub created_at_ms: i64,
+    pub event_type: String,
+    pub message: String,
+    pub status: Option<JobStatus>,
+    pub pid: Option<u32>,
+    pub last_exit_code: Option<i32>,
+    pub cpu_percent: Option<f32>,
+    pub rss_kb: Option<u64>,
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum JobStatus {
     Created,
@@ -264,6 +316,37 @@ impl Store {
             CREATE INDEX IF NOT EXISTS idx_executions_repo ON executions(git_repo);
             CREATE INDEX IF NOT EXISTS idx_executions_status ON executions(status);
             CREATE INDEX IF NOT EXISTS idx_jobs_name ON jobs(name);
+
+            CREATE TABLE IF NOT EXISTS job_resource_samples (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                job_id TEXT NOT NULL,
+                sampled_at_ms INTEGER NOT NULL,
+                status TEXT NOT NULL,
+                pid INTEGER,
+                last_exit_code INTEGER,
+                cpu_percent REAL,
+                rss_kb INTEGER,
+                restart_count INTEGER
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_job_resource_samples_job_time
+                ON job_resource_samples(job_id, sampled_at_ms DESC);
+
+            CREATE TABLE IF NOT EXISTS job_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                job_id TEXT NOT NULL,
+                created_at_ms INTEGER NOT NULL,
+                event_type TEXT NOT NULL,
+                message TEXT NOT NULL,
+                status TEXT,
+                pid INTEGER,
+                last_exit_code INTEGER,
+                cpu_percent REAL,
+                rss_kb INTEGER
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_job_events_job_time
+                ON job_events(job_id, created_at_ms DESC);
             "#,
         )?;
         self.ensure_executions_column("source", "TEXT NOT NULL DEFAULT 'stillrun'")?;
@@ -296,6 +379,16 @@ impl Store {
             self.refresh_imported_execution(record, source, source_id, command)?;
         }
         Ok(inserted)
+    }
+
+    pub fn insert_sourced_execution(
+        &self,
+        record: &NewExecution,
+        source: &str,
+        source_id: &str,
+        command: &str,
+    ) -> Result<Option<i64>> {
+        self.insert_execution_internal(record, source, Some(source_id), Some(command), true)
     }
 
     fn insert_execution_internal(
@@ -436,6 +529,47 @@ impl Store {
             .map_err(StillrunError::from)
     }
 
+    pub fn delete_execution(&self, id: i64) -> Result<bool> {
+        let deleted = self
+            .conn
+            .execute("DELETE FROM executions WHERE id = ?1", params![id])?;
+        Ok(deleted > 0)
+    }
+
+    pub fn clear_imported_history(&self) -> Result<usize> {
+        self.conn
+            .execute(
+                "DELETE FROM executions WHERE status = ?1",
+                params![ExecutionStatus::Imported.as_str()],
+            )
+            .map_err(StillrunError::from)
+    }
+
+    pub fn clear_history_source(&self, source: &str) -> Result<usize> {
+        self.conn
+            .execute("DELETE FROM executions WHERE source = ?1", params![source])
+            .map_err(StillrunError::from)
+    }
+
+    pub fn prune_history_before(&self, before_ms: i64, source: Option<&str>) -> Result<usize> {
+        match source {
+            Some(source) => self
+                .conn
+                .execute(
+                    "DELETE FROM executions WHERE started_at_ms < ?1 AND source = ?2",
+                    params![before_ms, source],
+                )
+                .map_err(StillrunError::from),
+            None => self
+                .conn
+                .execute(
+                    "DELETE FROM executions WHERE started_at_ms < ?1",
+                    params![before_ms],
+                )
+                .map_err(StillrunError::from),
+        }
+    }
+
     pub fn upsert_job(&self, record: &JobRecord) -> Result<()> {
         let argv = redact::redact_argv(&record.argv);
         let argv_json = serde_json::to_string(&argv)?;
@@ -525,6 +659,116 @@ impl Store {
         self.find_job(id)
     }
 
+    pub fn record_job_resource_sample(&self, sample: &NewJobResourceSample) -> Result<i64> {
+        self.conn.execute(
+            r#"
+            INSERT INTO job_resource_samples (
+                job_id, sampled_at_ms, status, pid, last_exit_code,
+                cpu_percent, rss_kb, restart_count
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+            "#,
+            params![
+                sample.job_id,
+                sample.sampled_at_ms,
+                sample.status.as_str(),
+                sample.pid.map(i64::from),
+                sample.last_exit_code,
+                sample.cpu_percent.map(f64::from),
+                sample.rss_kb.map(|rss| rss as i64),
+                sample.restart_count,
+            ],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    pub fn list_job_resource_samples(
+        &self,
+        job_id: &str,
+        limit: usize,
+    ) -> Result<Vec<JobResourceSample>> {
+        let mut statement = self.conn.prepare(
+            r#"
+            SELECT * FROM job_resource_samples
+            WHERE job_id = ?1
+            ORDER BY sampled_at_ms DESC
+            LIMIT ?2
+            "#,
+        )?;
+        let rows = statement.query_map(
+            params![job_id, limit_or_default(limit) as i64],
+            map_job_resource_sample_row,
+        )?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(StillrunError::from)
+    }
+
+    pub fn record_job_event(&self, event: &NewJobEvent) -> Result<i64> {
+        self.conn.execute(
+            r#"
+            INSERT INTO job_events (
+                job_id, created_at_ms, event_type, message, status,
+                pid, last_exit_code, cpu_percent, rss_kb
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+            "#,
+            params![
+                event.job_id,
+                event.created_at_ms,
+                event.event_type,
+                event.message,
+                event.status.map(JobStatus::as_str),
+                event.pid.map(i64::from),
+                event.last_exit_code,
+                event.cpu_percent.map(f64::from),
+                event.rss_kb.map(|rss| rss as i64),
+            ],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    pub fn list_job_events(&self, job_id: &str, limit: usize) -> Result<Vec<JobEventRecord>> {
+        self.list_job_events_after(job_id, None, limit)
+    }
+
+    pub fn list_job_events_after(
+        &self,
+        job_id: &str,
+        after_id: Option<i64>,
+        limit: usize,
+    ) -> Result<Vec<JobEventRecord>> {
+        let (sql, values) = match after_id {
+            Some(after_id) => (
+                r#"
+                SELECT * FROM job_events
+                WHERE job_id = ?1 AND id > ?2
+                ORDER BY id ASC
+                LIMIT ?3
+                "#,
+                vec![
+                    Value::Text(job_id.to_string()),
+                    Value::Integer(after_id),
+                    Value::Integer(limit_or_default(limit) as i64),
+                ],
+            ),
+            None => (
+                r#"
+                SELECT * FROM job_events
+                WHERE job_id = ?1
+                ORDER BY created_at_ms DESC, id DESC
+                LIMIT ?2
+                "#,
+                vec![
+                    Value::Text(job_id.to_string()),
+                    Value::Integer(limit_or_default(limit) as i64),
+                ],
+            ),
+        };
+        let params = params_from_iter(values.iter().map(|value| value as &dyn ToSql));
+        let mut statement = self.conn.prepare(sql)?;
+        let rows = statement.query_map(params, map_job_event_row)?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(StillrunError::from)
+    }
+
     pub fn list_jobs(&self) -> Result<Vec<JobRecord>> {
         let mut statement = self
             .conn
@@ -547,6 +791,19 @@ impl Store {
                 }
                 other => StillrunError::from(other),
             })
+    }
+
+    pub fn delete_job_record(&self, id: &str) -> Result<bool> {
+        self.conn.execute(
+            "DELETE FROM job_resource_samples WHERE job_id = ?1",
+            params![id],
+        )?;
+        self.conn
+            .execute("DELETE FROM job_events WHERE job_id = ?1", params![id])?;
+        let deleted = self
+            .conn
+            .execute("DELETE FROM jobs WHERE id = ?1", params![id])?;
+        Ok(deleted > 0)
     }
 
     fn ensure_executions_column(&self, name: &str, column_type: &str) -> Result<()> {
@@ -604,13 +861,19 @@ pub fn format_argv(argv: &[String]) -> String {
 }
 
 fn history_sql(filter: &HistoryFilter) -> String {
-    let fts_prefix = if filter
+    let prefix = if filter
         .query
         .as_deref()
-        .and_then(normalized_fts_query)
+        .and_then(normalized_query_text)
         .is_some()
     {
-        "SELECT e.* FROM executions e JOIN executions_fts ON executions_fts.rowid = e.id WHERE executions_fts MATCH ?"
+        r#"SELECT e.* FROM executions e WHERE (
+            e.id IN (SELECT rowid FROM executions_fts WHERE executions_fts MATCH ?)
+            OR e.command LIKE ? ESCAPE '\'
+            OR e.cwd LIKE ? ESCAPE '\'
+            OR e.stdout LIKE ? ESCAPE '\'
+            OR e.stderr LIKE ? ESCAPE '\'
+        )"#
     } else {
         "SELECT e.* FROM executions e WHERE 1 = 1"
     };
@@ -636,17 +899,28 @@ fn history_sql(filter: &HistoryFilter) -> String {
         .map(|_| " AND e.started_at_ms <= ?")
         .unwrap_or("");
     format!(
-        "{fts_prefix}{cwd_clause}{repo_clause}{status_clause}{started_after_clause}{started_before_clause} ORDER BY e.started_at_ms DESC LIMIT ?"
+        "{prefix}{cwd_clause}{repo_clause}{status_clause}{started_after_clause}{started_before_clause} ORDER BY e.started_at_ms DESC LIMIT ?"
     )
 }
 
 fn history_values(filter: &HistoryFilter) -> Vec<Value> {
-    let query_value = filter
+    let query_values = filter
         .query
         .as_deref()
-        .and_then(normalized_fts_query)
-        .map(Value::Text)
-        .into_iter();
+        .and_then(normalized_query_text)
+        .map(|query| {
+            let fts_query = fts_query_for_text(&query);
+            let like_query = like_query_for_text(&query);
+            [
+                Value::Text(fts_query),
+                Value::Text(like_query.clone()),
+                Value::Text(like_query.clone()),
+                Value::Text(like_query.clone()),
+                Value::Text(like_query),
+            ]
+        })
+        .into_iter()
+        .flatten();
     let cwd_value = filter
         .cwd
         .as_ref()
@@ -664,7 +938,7 @@ fn history_values(filter: &HistoryFilter) -> Vec<Value> {
         .into_iter();
     let started_after_value = filter.started_after_ms.map(Value::Integer).into_iter();
     let started_before_value = filter.started_before_ms.map(Value::Integer).into_iter();
-    query_value
+    query_values
         .chain(cwd_value)
         .chain(repo_value)
         .chain(status_value)
@@ -676,17 +950,29 @@ fn history_values(filter: &HistoryFilter) -> Vec<Value> {
         .collect()
 }
 
-fn normalized_fts_query(query: &str) -> Option<String> {
-    let value = query
-        .split_whitespace()
-        .map(|term| format!("\"{}\"", term.replace('"', "\"\"")))
-        .collect::<Vec<_>>()
-        .join(" ");
-    if value.is_empty() {
+fn normalized_query_text(query: &str) -> Option<String> {
+    let value = query.split_whitespace().collect::<Vec<_>>().join(" ");
+    if value.trim().is_empty() {
         None
     } else {
         Some(value)
     }
+}
+
+fn fts_query_for_text(query: &str) -> String {
+    query
+        .split_whitespace()
+        .map(|term| format!("\"{}\"", term.replace('"', "\"\"")))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn like_query_for_text(query: &str) -> String {
+    let escaped = query
+        .replace('\\', r"\\")
+        .replace('%', r"\%")
+        .replace('_', r"\_");
+    format!("%{escaped}%")
 }
 
 fn limit_or_default(limit: usize) -> usize {
@@ -759,6 +1045,45 @@ fn map_job_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<JobRecord> {
         last_rss_kb: row
             .get::<_, Option<i64>>("last_rss_kb")?
             .map(|rss| rss as u64),
+    })
+}
+
+fn map_job_resource_sample_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<JobResourceSample> {
+    let status_text: String = row.get("status")?;
+    Ok(JobResourceSample {
+        id: row.get("id")?,
+        job_id: row.get("job_id")?,
+        sampled_at_ms: row.get("sampled_at_ms")?,
+        status: JobStatus::parse(&status_text).map_err(to_sql_error)?,
+        pid: row.get::<_, Option<i64>>("pid")?.map(|pid| pid as u32),
+        last_exit_code: row.get("last_exit_code")?,
+        cpu_percent: row
+            .get::<_, Option<f64>>("cpu_percent")?
+            .map(|value| value as f32),
+        rss_kb: row.get::<_, Option<i64>>("rss_kb")?.map(|rss| rss as u64),
+        restart_count: row.get("restart_count")?,
+    })
+}
+
+fn map_job_event_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<JobEventRecord> {
+    let status_text: Option<String> = row.get("status")?;
+    Ok(JobEventRecord {
+        id: row.get("id")?,
+        job_id: row.get("job_id")?,
+        created_at_ms: row.get("created_at_ms")?,
+        event_type: row.get("event_type")?,
+        message: row.get("message")?,
+        status: status_text
+            .as_deref()
+            .map(JobStatus::parse)
+            .transpose()
+            .map_err(to_sql_error)?,
+        pid: row.get::<_, Option<i64>>("pid")?.map(|pid| pid as u32),
+        last_exit_code: row.get("last_exit_code")?,
+        cpu_percent: row
+            .get::<_, Option<f64>>("cpu_percent")?
+            .map(|value| value as f32),
+        rss_kb: row.get::<_, Option<i64>>("rss_kb")?.map(|rss| rss as u64),
     })
 }
 

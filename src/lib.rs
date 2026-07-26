@@ -10,6 +10,7 @@ pub mod logs;
 pub mod output;
 pub mod paths;
 pub mod redact;
+pub mod shell_hook;
 pub mod watch;
 
 pub use error::{Result, StillrunError};

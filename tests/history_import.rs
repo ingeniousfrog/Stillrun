@@ -51,7 +51,7 @@ fn imports_shell_history_as_searchable_imported_executions() {
     fs::write(
         &history_path,
         r#": 1700000000:0;npm run dev
-python scripts/lxy-1.py
+python scripts/prompt.py
 "#,
     )
     .unwrap();
@@ -63,7 +63,7 @@ python scripts/lxy-1.py
     let second = import_shell_history_file(&store, &history_path, ShellKind::Zsh, &home).unwrap();
     let matches = store
         .search_history(&HistoryFilter {
-            query: Some("lxy-1".into()),
+            query: Some("prompt".into()),
             status: Some(ExecutionStatus::Imported),
             limit: 10,
             ..HistoryFilter::default()

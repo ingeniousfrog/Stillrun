@@ -1,7 +1,7 @@
 use std::fs;
 
 use assert_cmd::Command;
-use predicates::str::contains;
+use predicates::str::{contains, is_empty};
 use stillrun::db::{JobRecord, JobStatus, Store};
 
 #[test]
@@ -91,6 +91,127 @@ fn cli_status_prints_job_runtime_summary() {
         .stdout(contains("runtime="))
         .stdout(contains("label: com.stillrun.dev.1"))
         .stdout(contains("stdout:"));
+}
+
+#[test]
+fn cli_jobs_monitor_records_samples_and_events() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = Store::open(temp.path().join("stillrun.db")).unwrap();
+    store.initialize().unwrap();
+    store.upsert_job(&job_record(temp.path())).unwrap();
+
+    Command::cargo_bin("stillrun")
+        .unwrap()
+        .env("STILLRUN_HOME", temp.path())
+        .args(["jobs", "monitor", "dev", "--once"])
+        .assert()
+        .success()
+        .stdout(contains("alerts=0"));
+
+    Command::cargo_bin("stillrun")
+        .unwrap()
+        .env("STILLRUN_HOME", temp.path())
+        .args(["jobs", "samples", "dev"])
+        .assert()
+        .success()
+        .stdout(contains("job=job-1"));
+
+    Command::cargo_bin("stillrun")
+        .unwrap()
+        .env("STILLRUN_HOME", temp.path())
+        .args(["jobs", "events", "dev"])
+        .assert()
+        .success()
+        .stdout(contains("type=status"));
+}
+
+#[test]
+fn cli_history_maintenance_commands_delete_clear_and_prune() {
+    let temp = tempfile::tempdir().unwrap();
+    let history_path = temp.path().join("zsh_history");
+    fs::write(&history_path, ": 1700000000:0;npm run imported-clear\n").unwrap();
+
+    Command::cargo_bin("stillrun")
+        .unwrap()
+        .env("STILLRUN_HOME", temp.path())
+        .args(["run", "--", "printf", "delete-cli"])
+        .assert()
+        .success();
+
+    Command::cargo_bin("stillrun")
+        .unwrap()
+        .env("STILLRUN_HOME", temp.path())
+        .args(["history", "--query", "delete-cli"])
+        .assert()
+        .success()
+        .stdout(contains("delete-cli"));
+
+    Command::cargo_bin("stillrun")
+        .unwrap()
+        .env("STILLRUN_HOME", temp.path())
+        .args(["history", "delete", "1"])
+        .assert()
+        .success()
+        .stdout(contains("deleted history #1"));
+
+    Command::cargo_bin("stillrun")
+        .unwrap()
+        .env("STILLRUN_HOME", temp.path())
+        .args(["history", "--query", "delete-cli"])
+        .assert()
+        .success()
+        .stdout(is_empty());
+
+    Command::cargo_bin("stillrun")
+        .unwrap()
+        .env("STILLRUN_HOME", temp.path())
+        .env("HOME", temp.path())
+        .args([
+            "import-history",
+            "--shell",
+            "zsh",
+            "--file",
+            history_path.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    Command::cargo_bin("stillrun")
+        .unwrap()
+        .env("STILLRUN_HOME", temp.path())
+        .args(["history", "clear", "--imported", "--yes"])
+        .assert()
+        .success()
+        .stdout(contains("deleted=1"));
+
+    Command::cargo_bin("stillrun")
+        .unwrap()
+        .env("STILLRUN_HOME", temp.path())
+        .args(["history", "prune", "--before-ms", "9999999999999", "--yes"])
+        .assert()
+        .success()
+        .stdout(contains("deleted=0"));
+}
+
+#[test]
+fn cli_jobs_delete_removes_job_record_and_plist() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = Store::open(temp.path().join("stillrun.db")).unwrap();
+    store.initialize().unwrap();
+    let job = job_record(temp.path());
+    fs::write(&job.plist_path, "<plist/>").unwrap();
+    store.upsert_job(&job).unwrap();
+
+    Command::cargo_bin("stillrun")
+        .unwrap()
+        .env("STILLRUN_HOME", temp.path())
+        .args(["jobs", "delete", "dev"])
+        .assert()
+        .success()
+        .stdout(contains("deleted job job-1"));
+
+    assert!(store.find_job("job-1").is_err());
+    assert!(!job.plist_path.exists());
 }
 
 #[test]
