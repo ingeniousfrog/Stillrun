@@ -54,8 +54,8 @@ fn launchd_background_job_lifecycle_e2e() {
         .args(["status", &job_name])
         .assert()
         .success()
-        .stdout(contains("runtime="))
-        .stdout(contains("stdout:"));
+        .stdout(contains("Status:"))
+        .stdout(contains("Recent stdout:"));
 
     stillrun_command(&home, temp.path())
         .args(["stop", &job_name])

@@ -104,10 +104,12 @@ fn cli_status_prints_job_runtime_summary() {
         .args(["status", "dev"])
         .assert()
         .success()
-        .stdout(contains("job-1"))
-        .stdout(contains("runtime="))
-        .stdout(contains("label: com.stillrun.dev.1"))
-        .stdout(contains("stdout:"));
+        .stdout(contains("Job dev (job-1)"))
+        .stdout(contains("Status:"))
+        .stdout(contains("Restart count:"))
+        .stdout(contains("Last sample:"))
+        .stdout(contains("Recent stdout:"))
+        .stdout(contains("Label: com.stillrun.dev.1"));
 }
 
 #[test]
@@ -123,7 +125,9 @@ fn cli_jobs_monitor_records_samples_and_events() {
         .args(["jobs", "monitor", "dev", "--once"])
         .assert()
         .success()
-        .stdout(contains("alerts=0"));
+        .stdout(contains("Job dev (job-1)"))
+        .stdout(contains("Last sample:"))
+        .stdout(contains("Alerts: 0"));
 
     Command::cargo_bin("stillrun")
         .unwrap()
@@ -139,7 +143,8 @@ fn cli_jobs_monitor_records_samples_and_events() {
         .args(["jobs", "events", "dev"])
         .assert()
         .success()
-        .stdout(contains("type=status"));
+        .stdout(contains("Timeline for dev (job-1)"))
+        .stdout(contains("status status="));
 }
 
 #[test]
@@ -435,7 +440,9 @@ fn cli_inspect_json_outputs_structured_execution_payload() {
         .args(["inspect", "1", "--json"])
         .assert()
         .success()
-        .stdout(contains(r#""type":"execution""#))
+        .stdout(contains(r#""schema_version":1"#))
+        .stdout(contains(r#""kind":"execution""#))
+        .stdout(contains(r#""execution":{"id":1"#))
         .stdout(contains(r#""command":"printf inspect-json""#));
 }
 

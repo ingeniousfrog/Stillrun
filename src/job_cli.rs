@@ -4,6 +4,10 @@ use clap::{Args, Subcommand};
 
 use crate::{
     db::{JobRecord, Store},
+    job_view::{
+        build_job_dashboard, format_job_dashboard, format_job_list, format_job_timeline,
+        format_job_timeline_event, JobListEntry,
+    },
     jobs::{self, status::RuntimeJobStatus},
     output::job_summary,
     Result,
@@ -64,7 +68,13 @@ pub struct JobSamplesArgs {
 pub async fn handle_jobs_command(store: &Store, args: JobsArgs) -> Result<()> {
     match args.action {
         Some(JobsCommand::Delete(delete_args)) => {
-            let job = jobs::delete_job(store, &delete_args.job, delete_args.keep_plist).await?;
+            let report =
+                jobs::delete_job_with_report(store, &delete_args.job, delete_args.keep_plist)
+                    .await?;
+            if let Some(warning) = &report.launchd_warning {
+                eprintln!("warning: {warning}");
+            }
+            let job = report.job;
             println!("deleted job {} plist={}", job.id, job.plist_path.display());
         }
         Some(JobsCommand::Monitor(monitor_args)) => {
@@ -80,10 +90,12 @@ pub async fn handle_jobs_command(store: &Store, args: JobsArgs) -> Result<()> {
             }
         }
         None => {
+            let mut entries = Vec::new();
             for job in store.list_jobs()? {
                 let (synced_job, runtime) = resolve_and_sync_job_runtime(store, job).await;
-                println!("{} {}", job_summary(&synced_job), runtime_suffix(&runtime));
+                entries.push(job_list_entry(store, synced_job, runtime)?);
             }
+            print!("{}", format_job_list(&entries));
         }
     }
     Ok(())
@@ -146,14 +158,17 @@ async fn monitor_job(store: &Store, args: JobMonitorArgs) -> Result<()> {
             args.cpu_alert,
             rss_alert_kb,
         )?;
+        if args.once {
+            let dashboard = build_job_dashboard(store, synced_job, runtime)?;
+            print!("{}", format_job_dashboard(&dashboard));
+            println!("Alerts: {alert_count}");
+            return Ok(());
+        }
         println!(
             "{} {} alerts={alert_count}",
             job_summary(&synced_job),
             runtime_suffix(&runtime)
         );
-        if args.once {
-            return Ok(());
-        }
         tokio::time::sleep(interval).await;
     }
 }
@@ -161,10 +176,11 @@ async fn monitor_job(store: &Store, args: JobMonitorArgs) -> Result<()> {
 async fn print_job_events(store: &Store, args: JobEventsArgs) -> Result<()> {
     let job = store.find_job(&args.job)?;
     let mut after_id = None;
-    for event in store.list_job_events(&job.id, args.limit)? {
+    let events = store.list_job_events(&job.id, args.limit)?;
+    for event in &events {
         after_id = Some(after_id.map_or(event.id, |current: i64| current.max(event.id)));
-        println!("{}", format_job_event(&event));
     }
+    print!("{}", format_job_timeline(&job, &events));
     if !args.follow {
         return Ok(());
     }
@@ -174,9 +190,24 @@ async fn print_job_events(store: &Store, args: JobEventsArgs) -> Result<()> {
         tokio::time::sleep(interval).await;
         for event in store.list_job_events_after(&job.id, after_id, args.limit)? {
             after_id = Some(after_id.map_or(event.id, |current: i64| current.max(event.id)));
-            println!("{}", format_job_event(&event));
+            println!("  {}", format_job_timeline_event(&event));
         }
     }
+}
+
+fn job_list_entry(
+    store: &Store,
+    job: JobRecord,
+    runtime: RuntimeJobStatus,
+) -> Result<JobListEntry> {
+    Ok(JobListEntry {
+        last_sample: store
+            .list_job_resource_samples(&job.id, 1)?
+            .into_iter()
+            .next(),
+        job,
+        runtime,
+    })
 }
 
 fn format_job_sample(sample: &crate::db::JobResourceSample) -> String {
@@ -211,36 +242,5 @@ fn format_job_sample(sample: &crate::db::JobResourceSample) -> String {
         rss,
         exit,
         restarts
-    )
-}
-
-fn format_job_event(event: &crate::db::JobEventRecord) -> String {
-    let status = event
-        .status
-        .map(|status| format!(" status={}", status.as_str()))
-        .unwrap_or_default();
-    let pid = event
-        .pid
-        .map(|pid| format!(" pid={pid}"))
-        .unwrap_or_default();
-    let cpu = event
-        .cpu_percent
-        .map(|cpu| format!(" cpu={cpu:.1}%"))
-        .unwrap_or_default();
-    let rss = event
-        .rss_kb
-        .map(|rss| format!(" rss={rss}kb"))
-        .unwrap_or_default();
-    format!(
-        "#{} job={} at={} type={}{}{}{}{} {}",
-        event.id,
-        event.job_id,
-        event.created_at_ms,
-        event.event_type,
-        status,
-        pid,
-        cpu,
-        rss,
-        event.message
     )
 }

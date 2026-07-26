@@ -9,6 +9,7 @@ pub mod execution;
 pub mod history_import;
 pub mod inspect;
 mod job_cli;
+pub mod job_view;
 pub mod jobs;
 pub mod logs;
 pub mod output;

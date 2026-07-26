@@ -473,17 +473,25 @@ pub async fn run() -> Result<()> {
                 let runtime = match jobs::status::resolve_runtime_status(&job).await {
                     Ok(runtime) => {
                         job = jobs::sync_job_runtime_status(&store, &job, &runtime).unwrap_or(job);
-                        Some(runtime)
+                        runtime
                     }
-                    Err(_) => None,
+                    Err(_) => jobs::status::RuntimeJobStatus::unknown(),
                 };
+                let dashboard = crate::job_view::build_job_dashboard(&store, job, runtime)?;
                 if args.json {
                     println!(
                         "{}",
-                        serde_json::to_string(&inspect::job_payload(job, runtime))?
+                        serde_json::to_string(&inspect::job_payload(
+                            dashboard.job,
+                            dashboard.runtime,
+                            dashboard.last_sample,
+                            dashboard.recent_events,
+                            dashboard.stdout,
+                            dashboard.stderr,
+                        ))?
                     );
                 } else {
-                    print!("{}", inspect::format_job_inspect(&job, runtime.as_ref()));
+                    print!("{}", crate::job_view::format_job_dashboard(&dashboard));
                 }
             }
         }
@@ -491,14 +499,8 @@ pub async fn run() -> Result<()> {
             let job = store.find_job(&args.job)?;
             let (synced_job, runtime) =
                 crate::job_cli::resolve_and_sync_job_runtime(&store, job).await;
-            println!(
-                "{} {}",
-                job_summary(&synced_job),
-                crate::job_cli::runtime_suffix(&runtime)
-            );
-            println!("label: {}", synced_job.label);
-            println!("stdout: {}", synced_job.stdout_path.display());
-            println!("stderr: {}", synced_job.stderr_path.display());
+            let dashboard = crate::job_view::build_job_dashboard(&store, synced_job, runtime)?;
+            print!("{}", crate::job_view::format_job_dashboard(&dashboard));
         }
         Commands::Start(args) => {
             let job = jobs::start_job(&store, &args.job).await?;

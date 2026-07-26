@@ -33,6 +33,12 @@ pub struct BackgroundRunRequest {
     pub keep_alive: bool,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct JobDeleteReport {
+    pub job: JobRecord,
+    pub launchd_warning: Option<String>,
+}
+
 pub async fn create_background_job(
     store: &Store,
     paths: &StillrunPaths,
@@ -166,7 +172,9 @@ pub async fn promote_execution_to_job(
 
 pub async fn stop_job(store: &Store, target: &str) -> Result<JobRecord> {
     let job = store.find_job(target)?;
-    bootout_job(&job).await?;
+    bootout_job(&job)
+        .await
+        .map_err(|err| launchd_operation_error("stop", &job, err))?;
     let stopped = JobRecord {
         updated_at_ms: now_ms(),
         status: JobStatus::Stopped,
@@ -186,11 +194,15 @@ pub async fn start_job(store: &Store, target: &str) -> Result<JobRecord> {
                 return sync_job_runtime_status(store, &job, &runtime);
             }
             LaunchdStartAction::Kickstart => {
-                kickstart_job(&job).await?;
+                kickstart_job(&job)
+                    .await
+                    .map_err(|err| launchd_operation_error("start", &job, err))?;
             }
         }
     } else {
-        bootstrap_job(&job).await?;
+        bootstrap_job(&job)
+            .await
+            .map_err(|err| launchd_operation_error("start", &job, err))?;
     }
     let running = JobRecord {
         updated_at_ms: now_ms(),
@@ -215,8 +227,12 @@ pub fn start_action_for_loaded_runtime_status(
 
 pub async fn restart_job(store: &Store, target: &str) -> Result<JobRecord> {
     let job = store.find_job(target)?;
-    let _ = bootout_job(&job).await;
-    bootstrap_job(&job).await?;
+    bootout_job(&job)
+        .await
+        .map_err(|err| launchd_operation_error("stop before restart", &job, err))?;
+    bootstrap_job(&job)
+        .await
+        .map_err(|err| launchd_operation_error("start after restart", &job, err))?;
     let running = JobRecord {
         updated_at_ms: now_ms(),
         status: JobStatus::Running,
@@ -229,17 +245,31 @@ pub async fn restart_job(store: &Store, target: &str) -> Result<JobRecord> {
 }
 
 pub async fn delete_job(store: &Store, target: &str, keep_plist: bool) -> Result<JobRecord> {
+    Ok(delete_job_with_report(store, target, keep_plist).await?.job)
+}
+
+pub async fn delete_job_with_report(
+    store: &Store,
+    target: &str,
+    keep_plist: bool,
+) -> Result<JobDeleteReport> {
     let job = store.find_job(target)?;
+    let mut launchd_warning = None;
     if cfg!(target_os = "macos") {
         if let Err(err) = bootout_job(&job).await {
-            tracing::warn!(job = %job.id, error = %err, "failed to unload launchd job before delete");
+            let warning = launchd_warning_for_delete(&job, err);
+            tracing::warn!(job = %job.id, warning = %warning, "failed to unload launchd job before delete");
+            launchd_warning = Some(warning);
         }
     }
     if !keep_plist && job.plist_path.exists() {
         std::fs::remove_file(&job.plist_path)?;
     }
     store.delete_job_record(&job.id)?;
-    Ok(job)
+    Ok(JobDeleteReport {
+        job,
+        launchd_warning,
+    })
 }
 
 pub fn sync_job_runtime_status(
@@ -362,16 +392,24 @@ fn record_runtime_change_events(
             runtime,
             observed_at_ms,
             "pid",
-            format!("pid {:?} -> {:?}", job.pid, runtime.pid),
+            format!(
+                "pid {} -> {}",
+                optional_value(job.pid),
+                optional_value(runtime.pid)
+            ),
         ))?;
     }
     if runtime.last_exit_code.is_some() && job.last_exit_code != runtime.last_exit_code {
+        let message = runtime
+            .last_exit_code
+            .map(|code| format!("exit code {code}"))
+            .unwrap_or_else(|| "exit code observed".into());
         store.record_job_event(&runtime_event(
             job,
             runtime,
             observed_at_ms,
             "exit",
-            format!("exit code -> {:?}", runtime.last_exit_code),
+            message,
         ))?;
     }
     if runtime
@@ -415,6 +453,7 @@ fn runtime_event(
 
 async fn bootstrap_job(job: &JobRecord) -> Result<()> {
     require_macos_launchd()?;
+    ensure_launchd_plist_exists(job, "start")?;
     let domain = launchd_domain().await?;
     let output = Command::new("launchctl")
         .args(["bootstrap", &domain])
@@ -453,6 +492,7 @@ async fn kickstart_job(job: &JobRecord) -> Result<()> {
 
 async fn bootout_job(job: &JobRecord) -> Result<()> {
     require_macos_launchd()?;
+    ensure_launchd_plist_exists(job, "stop")?;
     let domain = launchd_domain().await?;
     let output = Command::new("launchctl")
         .args(["bootout", &domain])
@@ -479,6 +519,53 @@ pub fn is_already_unloaded_bootout_error(stderr: &str) -> bool {
     lower.contains("no such process")
         || lower.contains("could not find service")
         || lower.contains("service not found")
+}
+
+pub fn format_launchd_operation_error(
+    operation: &str,
+    job: &JobRecord,
+    err: StillrunError,
+) -> String {
+    format!(
+        "could not {operation} job '{}' ({}) via launchd: {err}. plist={}. Try `stillrun status {}` to inspect the current state; if the plist is stale, use `stillrun jobs delete {}` to remove the local record.",
+        job.name,
+        job.id,
+        job.plist_path.display(),
+        job.name,
+        job.name
+    )
+}
+
+fn launchd_operation_error(operation: &str, job: &JobRecord, err: StillrunError) -> StillrunError {
+    StillrunError::invalid(format_launchd_operation_error(operation, job, err))
+}
+
+fn launchd_warning_for_delete(job: &JobRecord, err: StillrunError) -> String {
+    format!(
+        "could not unload job '{}' ({}) from launchd before deleting the local record: {err}. plist={}",
+        job.name,
+        job.id,
+        job.plist_path.display()
+    )
+}
+
+fn ensure_launchd_plist_exists(job: &JobRecord, operation: &str) -> Result<()> {
+    if job.plist_path.exists() {
+        return Ok(());
+    }
+    Err(StillrunError::not_found(format!(
+        "launchd plist for job '{}' ({}) at {}; cannot {operation}. Use `stillrun jobs delete {}` to remove the stale local record.",
+        job.name,
+        job.id,
+        job.plist_path.display(),
+        job.name
+    )))
+}
+
+fn optional_value<T: std::fmt::Display>(value: Option<T>) -> String {
+    value
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "-".into())
 }
 
 fn require_macos_launchd() -> Result<()> {
