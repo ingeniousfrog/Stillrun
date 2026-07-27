@@ -8,18 +8,82 @@ macOS CLI for **command history**, **safe replay**, and **launchd-backed Jobs**.
 
 ## Overview
 
-Stillrun turns terminal commands into searchable, inspectable records. Useful
-commands can be promoted into background Jobs with logs, status, and resource
-samples—without replacing your shell.
+Stillrun records terminal commands into a local searchable history. You can
+replay them later, or promote useful commands into background Jobs managed by
+launchd—with logs, status, and resource samples.
 
-**Primary use cases:** recoverable command history, one-shot or long-running
-background work, local Job observability.
+Stillrun complements your shell rather than replacing it.
 
-**Out of scope:** TUI / Web UI, AI search, remote nodes, Linux / Windows Job
-backends (MVP is macOS + launchd only).
+| Use case | Commands |
+| --- | --- |
+| Remember and search past commands | `stillrun run` / `history` / `import-history` |
+| Re-run a past command safely | `stillrun replay` |
+| Keep a long-running task alive | `stillrun run --background` / `jobs` / `logs` |
+| Auto-record future shell commands | `stillrun hook install` |
 
-Sensitive values are redacted before persistence. Replay restores recorded
-non-sensitive environment only—not your current shell session.
+**Platform:** macOS only for background Jobs (launchd).  
+**Not in scope:** TUI, Web UI, AI search, remote nodes, Linux / Windows Job backends.
+
+---
+
+## Installation
+
+**Recommended:** Homebrew via [ingeniousfrog/homebrew-tap](https://github.com/ingeniousfrog/homebrew-tap).
+
+```bash
+brew tap ingeniousfrog/tap
+brew install stillrun
+```
+
+Or install without tapping first:
+
+```bash
+brew install ingeniousfrog/tap/stillrun
+```
+
+Verify:
+
+```bash
+stillrun --version
+stillrun -h
+```
+
+Upgrade / uninstall:
+
+```bash
+brew update && brew upgrade stillrun
+brew uninstall stillrun
+```
+
+### Other install methods
+
+| Method | Command |
+| --- | --- |
+| Source (interactive) | `./scripts/install.sh` |
+| Source (non-interactive) | `cargo install --path .` |
+| Dev binary | `cargo run -- <args>` |
+
+Requires Rust **1.78+** for source builds. Packaging details: [`packaging/`](packaging/README.md).
+
+---
+
+## Getting Started
+
+```bash
+# Record a command
+stillrun run -- printf 'hello stillrun\n'
+
+# Find it
+stillrun history --query hello
+stillrun inspect 1
+
+# Optional: import existing shell history
+stillrun import-history --shell auto --preview
+stillrun import-history --shell auto --yes
+
+# Optional: auto-record future shell commands
+stillrun hook install --shell auto
+```
 
 ---
 
@@ -27,47 +91,68 @@ non-sensitive environment only—not your current shell session.
 
 | Area | Commands | Description |
 | --- | --- | --- |
-| Run & record | `run` | Capture argv, cwd, Git branch/head, timing, exit status, stdout/stderr, redacted env |
-| Shell wrapper | `run --shell` | Wrap complex shell syntax such as pipes, redirects, aliases, and functions in your shell |
-| History | `history` | Search with FTS5 + substring fallback; filter by cwd, repo, branch, exit code, status, time; output text or JSON |
+| Run & record | `run` | Capture argv, cwd, Git, timing, exit status, stdout/stderr, redacted env |
+| Shell wrapper | `run --shell` | Pipes, redirects, aliases, and functions via your login shell |
+| History | `history` | FTS5 + substring search; filter by cwd, repo, branch, exit code, status, time; text or JSON |
 | Import | `import-history` | Preview / import local zsh, bash, fish history |
 | Replay | `replay` | Re-run from original cwd with recorded non-sensitive env |
 | Promote | `promote` | Turn a past execution into a launchd Job |
-| Jobs | `jobs`, `status`, `start`, `stop`, `restart` | Lifecycle, dashboard, process-tree samples, events, optional background monitor |
+| Jobs | `jobs`, `status`, `start`, `stop`, `restart` | Lifecycle, dashboard, samples, events, optional background monitor |
 | Logs | `logs` | Tail or follow Job stdout/stderr |
 | Inspect | `inspect` | Human or JSON view of an execution or Job |
 | Config | `config` | Local TOML settings and redact-key management |
-| Shell integration | `hook`, `completion` | Auto-record future shell commands; tab completion |
+| Shell integration | `hook`, `completion` | Auto-record future commands; tab completion |
 
 ---
 
-## Quick start
+## Operational Workflows
+
+### Execution and Query
 
 ```bash
-brew tap ingeniousfrog/tap
-brew install stillrun
-```
-
-Verify:
-
-```bash
-stillrun -h
 stillrun run -- printf 'hello stillrun\n'
-stillrun run --shell 'npm run dev 2>&1 | tee dev.log'
+stillrun run --shell 'curl -s https://example.com | head -c 80'
 stillrun history --query hello
+stillrun history --status success --sort oldest
+stillrun history --since 7d --branch main --exit-code 1 --json
+stillrun inspect 1
+stillrun inspect 1 --json
 ```
 
-After installing, you can optionally import existing shell history and install a
-shell hook:
+### Replay
 
 ```bash
-stillrun import-history --shell auto --preview
+stillrun replay 1 --preview
+stillrun replay 1 --strict-context   # fail if cwd / Git context drifted
+stillrun replay 1 --yes
+```
+
+### Background Job Lifecycle
+
+```bash
+stillrun run --background --name demo-tick -- \
+  zsh -lc 'for i in 1 2 3; do echo tick-$i; sleep 1; done'
+
+stillrun jobs
+stillrun status demo-tick
+stillrun logs demo-tick
+stillrun jobs monitor demo-tick --once
+stillrun stop demo-tick
+stillrun jobs delete demo-tick
+```
+
+### Configuration and Shell Integration
+
+```bash
+stillrun config show
+stillrun config redact add session_token
 stillrun hook install --shell auto
+stillrun completion zsh > ~/.stillrun-completion.zsh
 ```
 
 ---
 
-## Workflow
+## Architecture
 
 ```mermaid
 flowchart LR
@@ -93,94 +178,11 @@ flowchart LR
   J --> L[launchd + logs]
 ```
 
-**Typical path:** record → search → replay or promote → manage Job lifecycle.
-
-```mermaid
-sequenceDiagram
-  participant U as User
-  participant S as stillrun
-  participant L as launchd
-  U->>S: run -- printf hello
-  S-->>U: recorded execution #1
-  U->>S: history --query hello
-  U->>S: run --background --name demo -- sleep 30
-  S->>L: bootstrap plist
-  U->>S: status demo / logs demo
-  U->>S: stop demo
-```
+Typical path: **record → search → replay or promote → manage Job**.
 
 ---
 
-## Installation
-
-**Current version:** `0.1.0`
-
-| Method | Command |
-| --- | --- |
-| Homebrew | `brew tap ingeniousfrog/tap && brew install stillrun` |
-| Homebrew direct | `brew install ingeniousfrog/tap/stillrun` |
-| Source interactive | `./scripts/install.sh` |
-| Source non-interactive | `cargo install --path .` |
-| Dev binary | `cargo run -- <args>` |
-
-Requires Rust **1.78+** and macOS (background Jobs use launchd).
-
-Isolate local state while experimenting:
-
-```bash
-export STILLRUN_HOME=/tmp/stillrun-dev
-stillrun run -- printf 'isolated\n'
-stillrun history
-```
-
----
-
-## Examples
-
-```bash
-# Record a foreground command
-stillrun run -- printf 'hello stillrun\n'
-stillrun run -- zsh -lc 'curl -s https://example.com | head -c 80'
-stillrun run --shell 'npm run dev 2>&1 | tee dev.log'
-
-# Search / inspect
-stillrun history --query hello
-stillrun history --status success --sort oldest
-stillrun history --since 7d --branch main --exit-code 1 --json
-stillrun inspect 1
-stillrun inspect 1 --json
-
-# Import shell history (preview first)
-stillrun import-history --shell auto --preview
-stillrun import-history --shell auto --yes
-
-# Replay
-stillrun replay 1 --preview
-stillrun replay 1 --strict-context
-stillrun replay 1 --yes
-
-# Background Job
-stillrun run --background --name demo-tick -- zsh -lc 'for i in 1 2 3; do echo tick-$i; sleep 1; done'
-stillrun jobs
-stillrun status demo-tick
-stillrun logs demo-tick
-stillrun logs demo-tick --max-bytes 10485760
-stillrun jobs monitor demo-tick --once
-stillrun jobs monitor demo-tick --background --name demo-monitor --interval-secs 5
-stillrun stop demo-tick
-stillrun jobs delete demo-tick
-
-# Config & shell helpers
-stillrun config show
-stillrun hook install --shell auto
-stillrun completion zsh > ~/.stillrun-completion.zsh
-```
-
----
-
-## Storage
-
-Default paths:
+## Data Locations
 
 ```text
 ~/Library/Application Support/Stillrun/stillrun.db
@@ -194,33 +196,34 @@ Default paths:
 | `STILLRUN_HOME` | Override the Stillrun data directory |
 | `STILLRUN_LAUNCH_AGENTS_DIR` | Override plist directory (tests / experiments) |
 
+Isolate state while experimenting:
+
+```bash
+export STILLRUN_HOME=/tmp/stillrun-dev
+stillrun run -- printf 'isolated\n'
+stillrun history
+```
+
 ---
 
-## Security
+## Security Boundaries
 
-Stillrun redacts common secrets before writing to SQLite—env keys such as
-`token` / `password` / `api_key`, and inline patterns like
-`Authorization: Bearer ...`, `token=...`, `--token value`.
+Stillrun redacts common secrets before writing to SQLite (env keys like
+`token` / `password` / `api_key`, and patterns like `Authorization: Bearer ...`,
+`token=...`, `--token value`).
 
-- **Replay** clears the current process environment, then restores recorded
-  non-redacted values only. `--strict-context` fails fast when the recorded cwd
-  is gone or the recorded Git branch/head no longer matches; Stillrun does not
-  checkout Git state, restore TTY state, or recreate shell aliases/functions
-  unless the command itself was captured as a shell command.
+- **Replay** restores recorded non-redacted env only—not your current shell.
+  `--strict-context` fails if cwd is gone or Git branch/head no longer matches.
 - **Imported** history requires `--preview` or `--yes` before replay.
 - **Shell hooks** record command text, cwd, Git metadata, and exit code—not
-  stdout/stderr. Use `stillrun run` or a Job when you need full output capture.
-- **Background Jobs** refuse command-line secret values by default because
-  launchd plists are files on disk. Move secrets into an external runtime source
-  or secret manager and pass references instead.
-- **Custom redaction keys** added with `stillrun config redact add KEY` are used
-  for env capture, argv/command persistence, and stdout/stderr redaction. During
-  foreground runs, sensitive env values from the current process are also scrubbed
-  from captured output.
+  stdout/stderr. Use `stillrun run` or a Job for full output capture.
+- **Background Jobs** refuse command-line secret values by default (launchd
+  plists are files on disk). Pass references, not raw secrets.
+- **Custom redact keys:** `stillrun config redact add KEY`.
 
 ---
 
-## Development
+## Development and Verification
 
 ```bash
 cargo fmt --all --check
@@ -228,8 +231,6 @@ cargo clippy --all-targets -- -D warnings
 cargo test
 cargo build --release
 ```
-
-Release packaging and Homebrew tap maintenance live in [`packaging/`](packaging/README.md).
 
 Real launchd lifecycle E2E (touches the user launchd session):
 
