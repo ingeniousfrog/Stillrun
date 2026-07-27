@@ -110,6 +110,9 @@ fn append_history_details(output: &mut String, record: &ExecutionRecord) {
     if let Some(branch) = &record.git_branch {
         output.push_str(&format!("  git branch: {branch}\n"));
     }
+    if let Some(head) = &record.git_head {
+        output.push_str(&format!("  git head: {head}\n"));
+    }
     output.push_str(&format!("  source: {}", record.source));
     if let Some(source_id) = &record.source_id {
         output.push_str(&format!(":{source_id}"));

@@ -23,6 +23,7 @@ fn builds_background_request_from_history_execution() {
                 cwd: PathBuf::from("/tmp/promote-project"),
                 git_repo: Some(PathBuf::from("/tmp/promote-project")),
                 git_branch: Some("main".into()),
+                git_head: Some("abc123".into()),
                 env,
             },
             started_at_ms: 10,

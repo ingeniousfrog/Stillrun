@@ -3,6 +3,7 @@ use std::time::Duration;
 use clap::{Args, Subcommand};
 
 use crate::{
+    config::StillrunConfig,
     db::{JobRecord, Store},
     job_view::{
         build_job_dashboard, format_job_dashboard, format_job_list, format_job_timeline,
@@ -10,6 +11,7 @@ use crate::{
     },
     jobs::{self, status::RuntimeJobStatus},
     output::job_summary,
+    paths::StillrunPaths,
     Result,
 };
 
@@ -45,6 +47,10 @@ pub struct JobMonitorArgs {
     pub cpu_alert: Option<f32>,
     #[arg(long)]
     pub rss_alert_mb: Option<u64>,
+    #[arg(long, conflicts_with = "once")]
+    pub background: bool,
+    #[arg(long)]
+    pub name: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -65,7 +71,12 @@ pub struct JobSamplesArgs {
     pub limit: usize,
 }
 
-pub async fn handle_jobs_command(store: &Store, args: JobsArgs) -> Result<()> {
+pub async fn handle_jobs_command(
+    store: &Store,
+    paths: &StillrunPaths,
+    config: &StillrunConfig,
+    args: JobsArgs,
+) -> Result<()> {
     match args.action {
         Some(JobsCommand::Delete(delete_args)) => {
             let report =
@@ -78,7 +89,11 @@ pub async fn handle_jobs_command(store: &Store, args: JobsArgs) -> Result<()> {
             println!("deleted job {} plist={}", job.id, job.plist_path.display());
         }
         Some(JobsCommand::Monitor(monitor_args)) => {
-            monitor_job(store, monitor_args).await?;
+            if monitor_args.background {
+                start_background_monitor(store, paths, config, monitor_args).await?;
+            } else {
+                monitor_job(store, monitor_args).await?;
+            }
         }
         Some(JobsCommand::Events(events_args)) => {
             print_job_events(store, events_args).await?;
@@ -98,6 +113,40 @@ pub async fn handle_jobs_command(store: &Store, args: JobsArgs) -> Result<()> {
             print!("{}", format_job_list(&entries));
         }
     }
+    Ok(())
+}
+
+async fn start_background_monitor(
+    store: &Store,
+    paths: &StillrunPaths,
+    config: &StillrunConfig,
+    args: JobMonitorArgs,
+) -> Result<()> {
+    let current_exe = std::env::current_exe()?;
+    let argv = jobs::build_monitor_job_argv(
+        &current_exe,
+        &args.job,
+        args.interval_secs,
+        args.cpu_alert,
+        args.rss_alert_mb,
+    );
+    let name = args
+        .name
+        .or_else(|| Some(format!("monitor-{}", sanitize_monitor_name(&args.job))));
+    let job = jobs::create_background_job(
+        store,
+        paths,
+        config,
+        jobs::BackgroundRunRequest {
+            argv,
+            name,
+            cwd: Some(std::env::current_dir()?),
+            context: None,
+            keep_alive: true,
+        },
+    )
+    .await?;
+    println!("{}", job_summary(&job));
     Ok(())
 }
 
@@ -243,4 +292,17 @@ fn format_job_sample(sample: &crate::db::JobResourceSample) -> String {
         exit,
         restarts
     )
+}
+
+fn sanitize_monitor_name(input: &str) -> String {
+    input
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+                ch
+            } else {
+                '-'
+            }
+        })
+        .collect()
 }

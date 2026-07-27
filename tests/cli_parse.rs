@@ -5,6 +5,28 @@ use stillrun::{
 };
 
 #[test]
+fn parses_run_shell_command() {
+    let cli = Cli::try_parse_from([
+        "stillrun",
+        "run",
+        "--shell",
+        "npm run dev 2>&1 | tee dev.log",
+    ])
+    .unwrap();
+
+    match cli.command {
+        Commands::Run(args) => {
+            assert_eq!(
+                args.shell.as_deref(),
+                Some("npm run dev 2>&1 | tee dev.log")
+            );
+            assert!(args.command.is_empty());
+        }
+        other => panic!("expected run command, got {other:?}"),
+    }
+}
+
+#[test]
 fn parses_start_job_command() {
     let cli = Cli::try_parse_from(["stillrun", "start", "dev-server"]).unwrap();
 
@@ -67,6 +89,35 @@ fn parses_history_display_flags() {
             assert!(args.details);
             assert!(args.pager);
             assert_eq!(args.width, Some(90));
+        }
+        other => panic!("expected history command, got {other:?}"),
+    }
+}
+
+#[test]
+fn parses_history_friendly_filters_and_json() {
+    let cli = Cli::try_parse_from([
+        "stillrun",
+        "history",
+        "--since",
+        "7d",
+        "--until",
+        "now",
+        "--exit-code",
+        "2",
+        "--branch",
+        "main",
+        "--json",
+    ])
+    .unwrap();
+
+    match cli.command {
+        Commands::History(args) => {
+            assert_eq!(args.since.as_deref(), Some("7d"));
+            assert_eq!(args.until.as_deref(), Some("now"));
+            assert_eq!(args.exit_code, Some(2));
+            assert_eq!(args.branch.as_deref(), Some("main"));
+            assert!(args.json);
         }
         other => panic!("expected history command, got {other:?}"),
     }
@@ -187,6 +238,64 @@ fn parses_jobs_monitor_command() {
 }
 
 #[test]
+fn parses_jobs_monitor_background_command() {
+    let cli = Cli::try_parse_from([
+        "stillrun",
+        "jobs",
+        "monitor",
+        "dev",
+        "--background",
+        "--name",
+        "dev-monitor",
+        "--interval-secs",
+        "2",
+    ])
+    .unwrap();
+
+    match cli.command {
+        Commands::Jobs(args) => match args.action.unwrap() {
+            stillrun::cli::JobsCommand::Monitor(monitor_args) => {
+                assert_eq!(monitor_args.job, "dev");
+                assert!(monitor_args.background);
+                assert_eq!(monitor_args.name.as_deref(), Some("dev-monitor"));
+                assert_eq!(monitor_args.interval_secs, 2);
+            }
+            other => panic!("expected jobs monitor command, got {other:?}"),
+        },
+        other => panic!("expected jobs command, got {other:?}"),
+    }
+}
+
+#[test]
+fn rejects_jobs_monitor_background_with_once() {
+    let error = Cli::try_parse_from([
+        "stillrun",
+        "jobs",
+        "monitor",
+        "dev",
+        "--background",
+        "--once",
+    ])
+    .unwrap_err()
+    .to_string();
+
+    assert!(error.contains("cannot be used with"));
+}
+
+#[test]
+fn parses_replay_strict_context_flag() {
+    let cli = Cli::try_parse_from(["stillrun", "replay", "12", "--strict-context"]).unwrap();
+
+    match cli.command {
+        Commands::Replay(args) => {
+            assert_eq!(args.id, 12);
+            assert!(args.strict_context);
+        }
+        other => panic!("expected replay command, got {other:?}"),
+    }
+}
+
+#[test]
 fn parses_jobs_events_and_samples_commands() {
     let events = Cli::try_parse_from([
         "stillrun", "jobs", "events", "dev", "--follow", "--limit", "20",
@@ -216,6 +325,30 @@ fn parses_jobs_events_and_samples_commands() {
             other => panic!("expected jobs samples command, got {other:?}"),
         },
         other => panic!("expected jobs command, got {other:?}"),
+    }
+}
+
+#[test]
+fn parses_logs_rotation_flags() {
+    let cli = Cli::try_parse_from([
+        "stillrun",
+        "logs",
+        "dev",
+        "--stderr",
+        "--rotate",
+        "--max-bytes",
+        "1048576",
+    ])
+    .unwrap();
+
+    match cli.command {
+        Commands::Logs(args) => {
+            assert_eq!(args.job, "dev");
+            assert!(args.stderr);
+            assert!(args.rotate);
+            assert_eq!(args.max_bytes, Some(1_048_576));
+        }
+        other => panic!("expected logs command, got {other:?}"),
     }
 }
 

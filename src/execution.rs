@@ -11,7 +11,8 @@ use crate::{
     config::StillrunConfig,
     context::CommandContext,
     db::{ExecutionStatus, NewExecution, Store},
-    redact, Result, StillrunError,
+    redact::{self, RedactionPolicy},
+    Result, StillrunError,
 };
 
 #[derive(Debug, Clone)]
@@ -39,14 +40,18 @@ pub async fn run_foreground(
     }
 
     let cwd = request.cwd.unwrap_or(std::env::current_dir()?);
-    let context = CommandContext::capture(&cwd);
+    let policy = config.redaction_policy().with_env_values_from_current_env();
+    let context = match request.env.clone() {
+        Some(env) => CommandContext::from_env(&cwd, env, &policy),
+        None => CommandContext::capture_with_policy(&cwd, &policy),
+    };
     let started_at_ms = now_ms();
     let spawn_result = build_command(&request.argv, &cwd, request.env.as_ref()).spawn();
     let child = match spawn_result {
         Ok(child) => child,
         Err(err) => {
             let ended_at_ms = now_ms();
-            let stderr = redact::redact_inline_secrets(&err.to_string());
+            let stderr = redact::redact_inline_secrets(&err.to_string(), &policy);
             let execution_id = store.insert_execution(&NewExecution {
                 argv: request.argv,
                 context,
@@ -79,8 +84,8 @@ pub async fn run_foreground(
     } else {
         ExecutionStatus::Failed
     };
-    let stdout = truncate_and_redact(&output.stdout, config.max_output_bytes);
-    let stderr = truncate_and_redact(&output.stderr, config.max_output_bytes);
+    let stdout = truncate_and_redact(&output.stdout, config.max_output_bytes, &policy);
+    let stderr = truncate_and_redact(&output.stderr, config.max_output_bytes, &policy);
     let execution_id = store.insert_execution(&NewExecution {
         argv: request.argv,
         context,
@@ -145,7 +150,7 @@ fn build_command(
     command
 }
 
-fn truncate_and_redact(bytes: &[u8], max_bytes: usize) -> String {
+fn truncate_and_redact(bytes: &[u8], max_bytes: usize, policy: &RedactionPolicy) -> String {
     let limit = max_bytes.min(bytes.len());
     let suffix = if bytes.len() > limit {
         "\n[stillrun: output truncated]\n"
@@ -153,7 +158,7 @@ fn truncate_and_redact(bytes: &[u8], max_bytes: usize) -> String {
         ""
     };
     let text = format!("{}{}", String::from_utf8_lossy(&bytes[..limit]), suffix);
-    redact::redact_inline_secrets(&text)
+    redact::redact_inline_secrets(&text, policy)
 }
 
 pub fn now_ms() -> i64 {

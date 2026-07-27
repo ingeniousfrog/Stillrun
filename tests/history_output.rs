@@ -75,6 +75,7 @@ fn execution_record(command: &str) -> ExecutionRecord {
         cwd: PathBuf::from("/tmp/stillrun-output"),
         git_repo: None,
         git_branch: None,
+        git_head: None,
         started_at_ms: 1_700_000_000_000,
         ended_at_ms: Some(1_700_000_000_010),
         duration_ms: Some(10),

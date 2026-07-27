@@ -39,7 +39,7 @@ pub fn record_shell_hook_execution(store: &Store, record: ShellHookRecord) -> Re
     let ended_at_ms = now_ms();
     let started_at_ms = record.started_at_ms.unwrap_or(ended_at_ms);
     let duration_ms = ended_at_ms.checked_sub(started_at_ms);
-    let context = CommandContext::capture(&record.cwd);
+    let context = CommandContext::capture_with_policy(&record.cwd, store.redaction_policy());
     let source = format!("shell-hook:{}", record.shell.as_str());
     let source_id = record
         .source_id

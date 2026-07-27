@@ -2,6 +2,12 @@ use std::path::Path;
 
 use crate::{Result, StillrunError};
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LogRotationReport {
+    pub rotated: bool,
+    pub rotated_path: Option<std::path::PathBuf>,
+}
+
 pub fn prepare_follow_log_file(path: &Path) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -34,6 +40,36 @@ pub fn tail_log_file(path: &Path, lines: usize) -> Result<String> {
     } else {
         Ok(format!("{selected}\n"))
     }
+}
+
+pub fn rotate_log_file(path: &Path, max_bytes: u64) -> Result<LogRotationReport> {
+    if !path.exists() {
+        return Err(StillrunError::not_found(format!(
+            "log file '{}'",
+            path.display()
+        )));
+    }
+    let metadata = std::fs::metadata(path)?;
+    if max_bytes > 0 && metadata.len() <= max_bytes {
+        return Ok(LogRotationReport {
+            rotated: false,
+            rotated_path: None,
+        });
+    }
+
+    let rotated_path = rotated_log_path(path);
+    std::fs::copy(path, &rotated_path)?;
+    std::fs::File::create(path)?;
+    Ok(LogRotationReport {
+        rotated: true,
+        rotated_path: Some(rotated_path),
+    })
+}
+
+fn rotated_log_path(path: &Path) -> std::path::PathBuf {
+    let mut value = path.as_os_str().to_os_string();
+    value.push(".1");
+    std::path::PathBuf::from(value)
 }
 
 pub async fn follow_log_file(path: &Path) -> Result<()> {

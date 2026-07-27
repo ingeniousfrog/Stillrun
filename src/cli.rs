@@ -1,5 +1,6 @@
 use std::{
     io::{self, IsTerminal, Write},
+    path::Path,
     process::{Command as StdCommand, Stdio},
 };
 
@@ -15,7 +16,8 @@ pub use crate::{
 
 use crate::{
     config::StillrunConfig,
-    db::{ExecutionStatus, HistoryFilter, HistorySortOrder, Store},
+    context::CommandContext,
+    db::{ExecutionRecord, ExecutionStatus, HistoryFilter, HistorySortOrder, Store},
     execution::{replay_execution, run_foreground, RunRequest},
     history_import::{
         format_import_preview, import_selected_shell_history_with_progress,
@@ -33,18 +35,20 @@ use crate::{
 
 const ROOT_HELP: &str = r#"Capabilities
   Run and record:       stillrun run -- npm run dev
-  Search history:       stillrun history --query "npm" --sort oldest
+  Shell command:        stillrun run --shell "npm run dev 2>&1 | tee dev.log"
+  Search history:       stillrun history --query "npm" --since 7d --json
   Import shell history: stillrun import-history --shell auto --preview
-  Replay safely:        stillrun replay 12 --preview
+  Replay safely:        stillrun replay 12 --preview | stillrun replay 12 --strict-context
   Promote to Job:       stillrun promote 12 --name dev-server
   Manage Jobs:          stillrun jobs | stillrun status dev-server | stillrun logs dev-server
+  Monitor Jobs:         stillrun jobs monitor dev-server --background --interval-secs 5
   Inspect as JSON:      stillrun inspect 12 --json
   Manage config:        stillrun config show | stillrun config set max-output-bytes 2097152
   Shell completion:     stillrun completion zsh > ~/.stillrun-completion.zsh
 
 Examples
   stillrun run -- zsh -lc "npm run dev 2>&1 | tee dev.log"
-  stillrun history --status imported --query "cargo"
+  stillrun history --status imported --query "cargo" --branch main
   stillrun run --background --name api -- cargo run
   stillrun jobs monitor api --once --cpu-alert 90 --rss-alert-mb 1024
   stillrun config redact add session_token
@@ -104,7 +108,9 @@ pub struct RunArgs {
     pub keep_alive: bool,
     #[arg(long)]
     pub cwd: Option<std::path::PathBuf>,
-    #[arg(required = true, last = true)]
+    #[arg(long, value_name = "COMMAND", conflicts_with = "command")]
+    pub shell: Option<String>,
+    #[arg(required_unless_present = "shell", last = true)]
     pub command: Vec<String>,
 }
 
@@ -124,8 +130,18 @@ pub struct HistoryArgs {
     pub since_ms: Option<i64>,
     #[arg(long)]
     pub until_ms: Option<i64>,
+    #[arg(long)]
+    pub since: Option<String>,
+    #[arg(long)]
+    pub until: Option<String>,
+    #[arg(long)]
+    pub exit_code: Option<i32>,
+    #[arg(long)]
+    pub branch: Option<String>,
     #[arg(short, long, default_value_t = 25)]
     pub limit: usize,
+    #[arg(long)]
+    pub json: bool,
     #[arg(long)]
     pub full: bool,
     #[arg(long)]
@@ -194,6 +210,8 @@ pub struct ReplayArgs {
     pub preview: bool,
     #[arg(long)]
     pub yes: bool,
+    #[arg(long)]
+    pub strict_context: bool,
 }
 
 #[derive(Debug, Args)]
@@ -226,6 +244,10 @@ pub struct LogsArgs {
     pub follow: bool,
     #[arg(short, long, default_value_t = 100)]
     pub lines: usize,
+    #[arg(long)]
+    pub rotate: bool,
+    #[arg(long)]
+    pub max_bytes: Option<u64>,
 }
 
 #[derive(Debug, Args)]
@@ -293,18 +315,19 @@ pub async fn run() -> Result<()> {
     let paths = StillrunPaths::discover()?;
     paths.ensure()?;
     let config = StillrunConfig::load(&paths)?;
-    let store = Store::open(&paths.db_path)?;
+    let store = Store::open_with_redaction_policy(&paths.db_path, config.redaction_policy())?;
     store.initialize()?;
 
     match cli.command {
         Commands::Run(args) => {
+            let argv = run_args_to_argv(&args)?;
             if args.background {
                 let job = jobs::create_background_job(
                     &store,
                     &paths,
                     &config,
                     BackgroundRunRequest {
-                        argv: args.command,
+                        argv,
                         name: args.name,
                         cwd: args.cwd,
                         context: None,
@@ -319,7 +342,7 @@ pub async fn run() -> Result<()> {
                 &store,
                 &config,
                 RunRequest {
-                    argv: args.command,
+                    argv,
                     cwd: args.cwd,
                     env: None,
                 },
@@ -373,11 +396,17 @@ pub async fn run() -> Result<()> {
                         .as_deref()
                         .map(ExecutionStatus::parse)
                         .transpose()?,
-                    started_after_ms: args.since_ms,
-                    started_before_ms: args.until_ms,
+                    started_after_ms: resolve_time_filter(args.since_ms, args.since.as_deref())?,
+                    started_before_ms: resolve_time_filter(args.until_ms, args.until.as_deref())?,
+                    exit_code: args.exit_code,
+                    branch: args.branch.clone(),
                     limit: args.limit,
                     sort: args.sort.into(),
                 })?;
+                if args.json {
+                    println!("{}", serde_json::to_string(&history_json(records))?);
+                    return Ok(());
+                }
                 let output = format_history_table(
                     &records,
                     &HistoryDisplayOptions {
@@ -397,6 +426,9 @@ pub async fn run() -> Result<()> {
             if args.preview {
                 print!("{}", inspect::format_replay_preview(&record));
                 return Ok(());
+            }
+            if args.strict_context {
+                validate_replay_context(&record)?;
             }
             if requires_replay_confirmation(&record) {
                 ensure_replay_confirmed(args.yes, &record)?;
@@ -437,7 +469,7 @@ pub async fn run() -> Result<()> {
             );
         }
         Commands::Jobs(args) => {
-            crate::job_cli::handle_jobs_command(&store, args).await?;
+            crate::job_cli::handle_jobs_command(&store, &paths, &config, args).await?;
         }
         Commands::Logs(args) => {
             let job = store.find_job(&args.job)?;
@@ -448,6 +480,19 @@ pub async fn run() -> Result<()> {
             };
             if args.follow {
                 logs::prepare_follow_log_file(&log_path)?;
+            }
+            if args.rotate || args.max_bytes.is_some() {
+                let report = logs::rotate_log_file(&log_path, args.max_bytes.unwrap_or(0))?;
+                if report.rotated {
+                    if let Some(path) = report.rotated_path {
+                        println!("rotated log to {}", path.display());
+                    }
+                } else {
+                    println!("log below rotation threshold");
+                }
+                if !args.follow {
+                    return Ok(());
+                }
             }
             let tail = logs::tail_log_file(&log_path, args.lines)?;
             if !tail.is_empty() {
@@ -612,6 +657,105 @@ fn terminal_width_from_env() -> Option<usize> {
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|width| *width >= 60)
+}
+
+fn run_args_to_argv(args: &RunArgs) -> Result<Vec<String>> {
+    if let Some(shell_command) = &args.shell {
+        if shell_command.trim().is_empty() {
+            return Err(crate::StillrunError::invalid(
+                "--shell command cannot be empty",
+            ));
+        }
+        return Ok(shell_command_argv(shell_command));
+    }
+    if args.command.is_empty() {
+        return Err(crate::StillrunError::invalid("run requires a command"));
+    }
+    Ok(args.command.clone())
+}
+
+fn shell_command_argv(command: &str) -> Vec<String> {
+    let shell = std::env::var("SHELL")
+        .ok()
+        .filter(|shell| !shell.trim().is_empty())
+        .unwrap_or_else(|| "/bin/sh".into());
+    let flag = if shell.ends_with("fish") { "-c" } else { "-lc" };
+    vec![shell, flag.into(), command.into()]
+}
+
+fn resolve_time_filter(ms_value: Option<i64>, friendly: Option<&str>) -> Result<Option<i64>> {
+    match (ms_value, friendly) {
+        (Some(_), Some(_)) => Err(crate::StillrunError::invalid(
+            "use either millisecond time flags or friendly time flags, not both",
+        )),
+        (Some(value), None) => Ok(Some(value)),
+        (None, Some(value)) => parse_friendly_time_filter(value).map(Some),
+        (None, None) => Ok(None),
+    }
+}
+
+fn parse_friendly_time_filter(value: &str) -> Result<i64> {
+    let value = value.trim();
+    if value.eq_ignore_ascii_case("now") {
+        return Ok(crate::execution::now_ms());
+    }
+    if let Ok(ms) = value.parse::<i64>() {
+        return Ok(ms);
+    }
+    let (number, unit) = value.split_at(value.len().saturating_sub(1));
+    let amount = number.parse::<i64>().map_err(|_| {
+        crate::StillrunError::invalid(
+            "time value must be milliseconds, 'now', or a duration like 30m, 12h, 7d",
+        )
+    })?;
+    let multiplier = match unit {
+        "s" | "S" => 1_000,
+        "m" | "M" => 60_000,
+        "h" | "H" => 3_600_000,
+        "d" | "D" => 86_400_000,
+        "w" | "W" => 604_800_000,
+        _ => {
+            return Err(crate::StillrunError::invalid(
+                "duration unit must be one of s, m, h, d, or w",
+            ))
+        }
+    };
+    Ok(crate::execution::now_ms() - amount.saturating_mul(multiplier))
+}
+
+fn history_json(records: Vec<ExecutionRecord>) -> Vec<inspect::ExecutionJson> {
+    records.into_iter().map(Into::into).collect()
+}
+
+fn validate_replay_context(record: &ExecutionRecord) -> Result<()> {
+    ensure_replay_cwd_exists(&record.cwd)?;
+    let current = CommandContext::capture(&record.cwd);
+    if let (Some(expected), Some(actual)) = (&record.git_branch, &current.git_branch) {
+        if expected != actual {
+            return Err(crate::StillrunError::invalid(format!(
+                "replay context mismatch: recorded git branch '{expected}', current branch '{actual}'"
+            )));
+        }
+    }
+    if let (Some(expected), Some(actual)) = (&record.git_head, &current.git_head) {
+        if expected != actual {
+            return Err(crate::StillrunError::invalid(format!(
+                "replay context mismatch: recorded git head '{expected}', current head '{actual}'"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn ensure_replay_cwd_exists(cwd: &Path) -> Result<()> {
+    if cwd.is_dir() {
+        Ok(())
+    } else {
+        Err(crate::StillrunError::not_found(format!(
+            "recorded replay cwd '{}'",
+            cwd.display()
+        )))
+    }
 }
 
 fn ensure_bulk_delete_confirmed(yes: bool, operation: &str) -> Result<()> {

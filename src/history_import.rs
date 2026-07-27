@@ -327,6 +327,7 @@ pub fn import_shell_history_file_with_progress(
                     cwd: fallback_cwd.to_path_buf(),
                     git_repo: None,
                     git_branch: None,
+                    git_head: None,
                     env: BTreeMap::new(),
                 },
                 started_at_ms,

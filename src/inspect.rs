@@ -39,6 +39,7 @@ pub struct ExecutionJson {
     pub cwd: String,
     pub git_repo: Option<String>,
     pub git_branch: Option<String>,
+    pub git_head: Option<String>,
     pub started_at_ms: i64,
     pub ended_at_ms: Option<i64>,
     pub duration_ms: Option<i64>,
@@ -144,6 +145,7 @@ impl From<ExecutionRecord> for ExecutionJson {
             cwd: record.cwd.display().to_string(),
             git_repo: record.git_repo.map(|path| path.display().to_string()),
             git_branch: record.git_branch,
+            git_head: record.git_head,
             started_at_ms: record.started_at_ms,
             ended_at_ms: record.ended_at_ms,
             duration_ms: record.duration_ms,
@@ -284,6 +286,9 @@ pub fn format_execution_inspect(record: &ExecutionRecord) -> String {
     if let Some(branch) = &record.git_branch {
         output.push_str(&format!("  git branch: {branch}\n"));
     }
+    if let Some(head) = &record.git_head {
+        output.push_str(&format!("  git head: {head}\n"));
+    }
     output.push_str(&format!("  source: {}", record.source));
     if let Some(source_id) = &record.source_id {
         output.push_str(&format!(":{source_id}"));
@@ -316,5 +321,28 @@ pub fn format_replay_preview(record: &ExecutionRecord) -> String {
     if let Some(branch) = &record.git_branch {
         output.push_str(&format!("  git branch: {branch}\n"));
     }
+    if let Some(head) = &record.git_head {
+        output.push_str(&format!("  git head: {head}\n"));
+    } else {
+        output.push_str("  git head: -\n");
+    }
+    let (restorable, redacted) = env_restore_counts(record);
+    output.push_str(&format!("  restorable env: {restorable}\n"));
+    output.push_str(&format!("  redacted env omitted: {redacted}\n"));
+    output.push_str(
+        "  replay scope: restores argv, cwd, and non-redacted env; does not checkout git state or restore shell aliases/functions/TTY\n",
+    );
     output
+}
+
+fn env_restore_counts(record: &ExecutionRecord) -> (usize, usize) {
+    let env = serde_json::from_str::<std::collections::BTreeMap<String, String>>(&record.env_json)
+        .unwrap_or_default();
+    env.values().fold((0, 0), |(restorable, redacted), value| {
+        if value == crate::redact::REDACTED {
+            (restorable, redacted + 1)
+        } else {
+            (restorable + 1, redacted)
+        }
+    })
 }

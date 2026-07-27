@@ -2,7 +2,7 @@ use std::collections::BTreeSet;
 
 use serde::{Deserialize, Serialize};
 
-use crate::{paths::StillrunPaths, Result};
+use crate::{paths::StillrunPaths, redact::RedactionPolicy, Result};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StillrunConfig {
@@ -14,19 +14,10 @@ impl Default for StillrunConfig {
     fn default() -> Self {
         Self {
             max_output_bytes: 1_048_576,
-            redact_keys: [
-                "token",
-                "secret",
-                "password",
-                "passwd",
-                "api_key",
-                "apikey",
-                "credential",
-                "private_key",
-            ]
-            .into_iter()
-            .map(String::from)
-            .collect(),
+            redact_keys: crate::redact::default_sensitive_keys()
+                .into_iter()
+                .map(String::from)
+                .collect(),
         }
     }
 }
@@ -47,6 +38,10 @@ impl StillrunConfig {
         let text = toml::to_string_pretty(self)?;
         std::fs::write(&paths.config_path, text)?;
         Ok(())
+    }
+
+    pub fn redaction_policy(&self) -> RedactionPolicy {
+        RedactionPolicy::from_keys(self.redact_keys.iter())
     }
 
     pub fn set_value(&mut self, key: &str, value: &str) -> Result<()> {

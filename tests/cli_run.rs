@@ -18,7 +18,10 @@ fn cli_short_help_shows_capabilities_and_examples() {
         .stdout(contains("Examples"))
         .stdout(contains("Run and record"))
         .stdout(contains("stillrun run -- npm run dev"))
-        .stdout(contains("stillrun history --query \"npm\" --sort oldest"));
+        .stdout(contains("stillrun run --shell"))
+        .stdout(contains(
+            "stillrun history --query \"npm\" --since 7d --json",
+        ));
 }
 
 #[test]
@@ -63,6 +66,71 @@ fn cli_replay_uses_original_command_and_cwd() {
 }
 
 #[test]
+fn cli_run_shell_wraps_complex_command_for_replayable_history() {
+    let temp = tempfile::tempdir().unwrap();
+
+    Command::cargo_bin("stillrun")
+        .unwrap()
+        .env("STILLRUN_HOME", temp.path())
+        .env("SHELL", "/bin/sh")
+        .args(["run", "--shell", "printf shell-ok"])
+        .assert()
+        .success()
+        .stdout(contains("shell-ok"));
+
+    Command::cargo_bin("stillrun")
+        .unwrap()
+        .env("STILLRUN_HOME", temp.path())
+        .args(["history", "--query", "shell-ok", "--full"])
+        .assert()
+        .success()
+        .stdout(contains("/bin/sh -lc 'printf shell-ok'"));
+}
+
+#[test]
+fn cli_configured_redact_keys_apply_to_persisted_history() {
+    let temp = tempfile::tempdir().unwrap();
+
+    Command::cargo_bin("stillrun")
+        .unwrap()
+        .env("STILLRUN_HOME", temp.path())
+        .args(["config", "redact", "add", "customsecret"])
+        .assert()
+        .success();
+
+    Command::cargo_bin("stillrun")
+        .unwrap()
+        .env("STILLRUN_HOME", temp.path())
+        .env("CUSTOMSECRET", "env-sentinel")
+        .args([
+            "run",
+            "--",
+            "/bin/sh",
+            "-c",
+            "printf '%s' \"$CUSTOMSECRET\"; printf '%s' ' --customsecret arg-sentinel'",
+        ])
+        .assert()
+        .success()
+        .stdout(contains(stillrun::redact::REDACTED));
+
+    Command::cargo_bin("stillrun")
+        .unwrap()
+        .env("STILLRUN_HOME", temp.path())
+        .args(["history", "--query", "sentinel", "--full", "--details"])
+        .assert()
+        .success()
+        .stdout(is_empty());
+
+    Command::cargo_bin("stillrun")
+        .unwrap()
+        .env("STILLRUN_HOME", temp.path())
+        .args(["history", "--query", stillrun::redact::REDACTED, "--full"])
+        .assert()
+        .success()
+        .stdout(contains(stillrun::redact::REDACTED));
+}
+
+#[test]
 fn cli_replay_does_not_inherit_new_environment_values() {
     let temp = tempfile::tempdir().unwrap();
 
@@ -89,6 +157,31 @@ fn cli_replay_does_not_inherit_new_environment_values() {
         .assert()
         .success()
         .stdout(contains("unset"));
+}
+
+#[test]
+fn cli_replay_preview_explains_environment_and_context_limits() {
+    let temp = tempfile::tempdir().unwrap();
+
+    Command::cargo_bin("stillrun")
+        .unwrap()
+        .env("STILLRUN_HOME", temp.path())
+        .env("SAFE_REPLAY_FLAG", "yes")
+        .env("API_TOKEN", "secret-token")
+        .args(["run", "--", "printf", "preview-env"])
+        .assert()
+        .success();
+
+    Command::cargo_bin("stillrun")
+        .unwrap()
+        .env("STILLRUN_HOME", temp.path())
+        .args(["replay", "1", "--preview"])
+        .assert()
+        .success()
+        .stdout(contains("restorable env:"))
+        .stdout(contains("redacted env omitted:"))
+        .stdout(contains("git head:"))
+        .stdout(contains("does not checkout git state"));
 }
 
 #[test]
@@ -354,6 +447,7 @@ fn cli_replay_imported_history_requires_preview_or_confirmation() {
                     cwd: temp.path().to_path_buf(),
                     git_repo: None,
                     git_branch: None,
+                    git_head: None,
                     env: Default::default(),
                 },
                 started_at_ms: 1_700_000_000_000,
@@ -421,6 +515,54 @@ fn cli_history_sort_controls_display_order() {
     let text = String::from_utf8(output).unwrap();
 
     assert!(text.find("old-cli").unwrap() < text.find("new-cli").unwrap());
+}
+
+#[test]
+fn cli_history_json_supports_exit_branch_and_since_filters() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = Store::open(temp.path().join("stillrun.db")).unwrap();
+    store.initialize().unwrap();
+    store
+        .insert_execution(&NewExecution {
+            argv: vec!["sh".into(), "-c".into(), "exit 2".into()],
+            context: CommandContext {
+                cwd: temp.path().to_path_buf(),
+                git_repo: Some(temp.path().to_path_buf()),
+                git_branch: Some("main".into()),
+                git_head: Some("abc123".into()),
+                env: Default::default(),
+            },
+            started_at_ms: 2_000,
+            ended_at_ms: Some(2_010),
+            duration_ms: Some(10),
+            exit_code: Some(2),
+            status: ExecutionStatus::Failed,
+            stdout: String::new(),
+            stderr: "failed-json".into(),
+            pid: None,
+            background_job_id: None,
+            restart_count: 0,
+        })
+        .unwrap();
+
+    Command::cargo_bin("stillrun")
+        .unwrap()
+        .env("STILLRUN_HOME", temp.path())
+        .args([
+            "history",
+            "--since",
+            "1000",
+            "--exit-code",
+            "2",
+            "--branch",
+            "main",
+            "--json",
+        ])
+        .assert()
+        .success()
+        .stdout(contains(r#""command":"sh -c 'exit 2'""#))
+        .stdout(contains(r#""git_branch":"main""#))
+        .stdout(contains(r#""exit_code":2"#));
 }
 
 #[test]
@@ -543,6 +685,7 @@ fn insert_test_execution(store: &Store, cwd: &std::path::Path, label: &str, star
                 cwd: cwd.to_path_buf(),
                 git_repo: None,
                 git_branch: None,
+                git_head: None,
                 env: Default::default(),
             },
             started_at_ms,

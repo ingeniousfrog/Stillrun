@@ -1,7 +1,11 @@
 pub mod launchd;
 pub mod status;
 
-use std::{collections::BTreeMap, path::PathBuf, process::Stdio};
+use std::{
+    collections::BTreeMap,
+    path::{Path, PathBuf},
+    process::Stdio,
+};
 
 use tokio::process::Command;
 
@@ -15,7 +19,8 @@ use crate::{
     execution::now_ms,
     jobs::launchd::LaunchdJobSpec,
     paths::StillrunPaths,
-    redact, Result, StillrunError,
+    redact::{self, RedactionPolicy},
+    Result, StillrunError,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -42,12 +47,14 @@ pub struct JobDeleteReport {
 pub async fn create_background_job(
     store: &Store,
     paths: &StillrunPaths,
-    _config: &StillrunConfig,
+    config: &StillrunConfig,
     request: BackgroundRunRequest,
 ) -> Result<JobRecord> {
     if request.argv.is_empty() {
         return Err(StillrunError::invalid("background run requires a command"));
     }
+    let policy = config.redaction_policy();
+    validate_background_argv_is_safe(&request.argv, &policy)?;
 
     paths.ensure()?;
     std::fs::create_dir_all(&paths.launch_agents_dir)?;
@@ -55,7 +62,7 @@ pub async fn create_background_job(
         Some(context) => context,
         None => {
             let cwd = request.cwd.unwrap_or(std::env::current_dir()?);
-            CommandContext::capture(&cwd)
+            CommandContext::capture_with_policy(&cwd, &policy)
         }
     };
     let cwd = context.cwd.clone();
@@ -68,8 +75,8 @@ pub async fn create_background_job(
     let stdout_path = paths.logs_dir.join(format!("{id}.stdout.log"));
     let stderr_path = paths.logs_dir.join(format!("{id}.stderr.log"));
     let plist_path = paths.launch_agents_dir.join(format!("{label}.plist"));
-    let persisted_argv = redact::redact_argv(&request.argv);
-    let command = redact::redact_inline_secrets(&format_argv(&persisted_argv));
+    let persisted_argv = redact::redact_argv(&request.argv, &policy);
+    let command = redact::redact_inline_secrets(&format_argv(&persisted_argv), &policy);
     let spec = LaunchdJobSpec {
         label: label.clone(),
         argv: request.argv.clone(),
@@ -147,6 +154,7 @@ pub fn background_request_from_execution(
         cwd: execution.cwd.clone(),
         git_repo: execution.git_repo.clone(),
         git_branch: execution.git_branch.clone(),
+        git_head: execution.git_head.clone(),
         env,
     };
     Ok(BackgroundRunRequest {
@@ -156,6 +164,41 @@ pub fn background_request_from_execution(
         context: Some(context),
         keep_alive,
     })
+}
+
+pub fn validate_background_argv_is_safe(argv: &[String], policy: &RedactionPolicy) -> Result<()> {
+    if redact::argv_contains_sensitive_value(argv, policy) {
+        return Err(StillrunError::invalid(
+            "sensitive command argument detected; refusing to write it into a launchd plist. Move the secret to a runtime-only environment source or secret manager, then pass a reference instead.",
+        ));
+    }
+    Ok(())
+}
+
+pub fn build_monitor_job_argv(
+    current_exe: &Path,
+    target: &str,
+    interval_secs: u64,
+    cpu_alert: Option<f32>,
+    rss_alert_mb: Option<u64>,
+) -> Vec<String> {
+    let mut argv = vec![
+        current_exe.to_string_lossy().to_string(),
+        "jobs".into(),
+        "monitor".into(),
+        target.into(),
+        "--interval-secs".into(),
+        interval_secs.max(1).to_string(),
+    ];
+    if let Some(cpu_alert) = cpu_alert {
+        argv.push("--cpu-alert".into());
+        argv.push(cpu_alert.to_string());
+    }
+    if let Some(rss_alert_mb) = rss_alert_mb {
+        argv.push("--rss-alert-mb".into());
+        argv.push(rss_alert_mb.to_string());
+    }
+    argv
 }
 
 pub async fn promote_execution_to_job(
@@ -172,9 +215,11 @@ pub async fn promote_execution_to_job(
 
 pub async fn stop_job(store: &Store, target: &str) -> Result<JobRecord> {
     let job = store.find_job(target)?;
+    let descendant_pids = descendant_pids_for_job(&job).await;
     bootout_job(&job)
         .await
         .map_err(|err| launchd_operation_error("stop", &job, err))?;
+    terminate_descendant_pids(descendant_pids).await;
     let stopped = JobRecord {
         updated_at_ms: now_ms(),
         status: JobStatus::Stopped,
@@ -227,9 +272,11 @@ pub fn start_action_for_loaded_runtime_status(
 
 pub async fn restart_job(store: &Store, target: &str) -> Result<JobRecord> {
     let job = store.find_job(target)?;
+    let descendant_pids = descendant_pids_for_job(&job).await;
     bootout_job(&job)
         .await
         .map_err(|err| launchd_operation_error("stop before restart", &job, err))?;
+    terminate_descendant_pids(descendant_pids).await;
     bootstrap_job(&job)
         .await
         .map_err(|err| launchd_operation_error("start after restart", &job, err))?;
@@ -512,6 +559,30 @@ async fn bootout_job(job: &JobRecord) -> Result<()> {
         "launchctl bootout failed: {}",
         stderr.trim()
     )))
+}
+
+async fn descendant_pids_for_job(job: &JobRecord) -> Vec<u32> {
+    match status::resolve_loaded_runtime_status(job).await {
+        Ok(Some(runtime)) => match runtime.pid {
+            Some(pid) => status::resolve_descendant_pids(pid)
+                .await
+                .unwrap_or_default(),
+            None => Vec::new(),
+        },
+        _ => Vec::new(),
+    }
+}
+
+async fn terminate_descendant_pids(mut pids: Vec<u32>) {
+    pids.sort_unstable_by(|left, right| right.cmp(left));
+    for pid in pids {
+        let _ = Command::new("kill")
+            .args(["-TERM", &pid.to_string()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .await;
+    }
 }
 
 pub fn is_already_unloaded_bootout_error(stderr: &str) -> bool {

@@ -1,4 +1,7 @@
-use std::process::Stdio;
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    process::Stdio,
+};
 
 use serde::Serialize;
 use tokio::process::Command;
@@ -114,6 +117,18 @@ pub fn parse_ps_output(text: &str) -> Option<(f32, u64)> {
 
 async fn sample_process_resources(pid: u32) -> Result<(Option<f32>, Option<u64>)> {
     let output = Command::new("ps")
+        .args(["-axo", "pid=", "-o", "ppid=", "-o", "%cpu=", "-o", "rss="])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .await?;
+    if let Some((cpu_percent, rss_kb)) =
+        parse_ps_tree_output(&String::from_utf8_lossy(&output.stdout), pid)
+    {
+        return Ok((Some(cpu_percent), Some(rss_kb)));
+    }
+
+    let output = Command::new("ps")
         .args(["-o", "%cpu=", "-o", "rss=", "-p", &pid.to_string()])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -123,6 +138,116 @@ async fn sample_process_resources(pid: u32) -> Result<(Option<f32>, Option<u64>)
         .map(|(cpu, rss)| (Some(cpu), Some(rss)))
         .unwrap_or((None, None));
     Ok((cpu_percent, rss_kb))
+}
+
+pub fn parse_ps_tree_output(text: &str, root_pid: u32) -> Option<(f32, u64)> {
+    let rows = text
+        .lines()
+        .filter_map(parse_ps_tree_row)
+        .collect::<Vec<_>>();
+    if rows.is_empty() {
+        return None;
+    }
+
+    let resources = rows
+        .iter()
+        .map(|row| (row.pid, (row.cpu_percent, row.rss_kb)))
+        .collect::<BTreeMap<_, _>>();
+    if !resources.contains_key(&root_pid) {
+        return None;
+    }
+    let mut children: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
+    for row in &rows {
+        children.entry(row.ppid).or_default().push(row.pid);
+    }
+
+    let mut stack = vec![root_pid];
+    let mut seen = BTreeSet::new();
+    let mut cpu = 0.0;
+    let mut rss = 0_u64;
+    while let Some(pid) = stack.pop() {
+        if !seen.insert(pid) {
+            continue;
+        }
+        if let Some((pid_cpu, pid_rss)) = resources.get(&pid) {
+            cpu += *pid_cpu;
+            rss = rss.saturating_add(*pid_rss);
+        }
+        if let Some(child_pids) = children.get(&pid) {
+            stack.extend(child_pids.iter().copied());
+        }
+    }
+    Some((round_cpu(cpu), rss))
+}
+
+pub async fn resolve_descendant_pids(root_pid: u32) -> Result<Vec<u32>> {
+    let output = Command::new("ps")
+        .args(["-axo", "pid=", "-o", "ppid="])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .await?;
+    Ok(parse_descendant_pids(
+        &String::from_utf8_lossy(&output.stdout),
+        root_pid,
+    ))
+}
+
+pub fn parse_descendant_pids(text: &str, root_pid: u32) -> Vec<u32> {
+    let mut children: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
+    for line in text.lines() {
+        let fields = line.split_whitespace().collect::<Vec<_>>();
+        if fields.len() < 2 {
+            continue;
+        }
+        let Some(pid) = fields[0].parse::<u32>().ok() else {
+            continue;
+        };
+        let Some(ppid) = fields[1].parse::<u32>().ok() else {
+            continue;
+        };
+        children.entry(ppid).or_default().push(pid);
+    }
+
+    let mut descendants = Vec::new();
+    let mut stack = children.get(&root_pid).cloned().unwrap_or_default();
+    let mut seen = BTreeSet::new();
+    while let Some(pid) = stack.pop() {
+        if !seen.insert(pid) {
+            continue;
+        }
+        descendants.push(pid);
+        if let Some(child_pids) = children.get(&pid) {
+            stack.extend(child_pids.iter().copied());
+        }
+    }
+    descendants.sort_unstable();
+    descendants
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PsTreeRow {
+    pid: u32,
+    ppid: u32,
+    cpu_percent: f32,
+    rss_kb: u64,
+}
+
+fn parse_ps_tree_row(line: &str) -> Option<PsTreeRow> {
+    let fields = line.split_whitespace().collect::<Vec<_>>();
+    if fields.len() < 4 {
+        return None;
+    }
+    Some(PsTreeRow {
+        pid: fields[0].parse().ok()?,
+        ppid: fields[1].parse().ok()?,
+        cpu_percent: fields[2].parse().ok()?,
+        rss_kb: fields[3].parse().ok()?,
+    })
+}
+
+fn round_cpu(value: f32) -> f32 {
+    (value * 10.0).round() / 10.0
 }
 
 fn parse_pid_line(line: &str) -> Option<u32> {

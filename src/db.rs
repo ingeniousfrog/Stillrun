@@ -10,7 +10,11 @@ use rusqlite::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::{context::CommandContext, redact, Result, StillrunError};
+use crate::{
+    context::CommandContext,
+    redact::{self, RedactionPolicy},
+    Result, StillrunError,
+};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ExecutionRecord {
@@ -20,6 +24,7 @@ pub struct ExecutionRecord {
     pub cwd: PathBuf,
     pub git_repo: Option<PathBuf>,
     pub git_branch: Option<String>,
+    pub git_head: Option<String>,
     pub started_at_ms: i64,
     pub ended_at_ms: Option<i64>,
     pub duration_ms: Option<i64>,
@@ -93,6 +98,8 @@ pub struct HistoryFilter {
     pub status: Option<ExecutionStatus>,
     pub started_after_ms: Option<i64>,
     pub started_before_ms: Option<i64>,
+    pub exit_code: Option<i32>,
+    pub branch: Option<String>,
     pub limit: usize,
     pub sort: HistorySortOrder,
 }
@@ -227,6 +234,7 @@ impl JobStatus {
 
 pub struct Store {
     conn: Connection,
+    redaction_policy: RedactionPolicy,
 }
 
 struct PreparedExecution {
@@ -239,11 +247,25 @@ struct PreparedExecution {
 
 impl Store {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+        Self::open_with_redaction_policy(path, RedactionPolicy::default())
+    }
+
+    pub fn open_with_redaction_policy(
+        path: impl AsRef<Path>,
+        redaction_policy: RedactionPolicy,
+    ) -> Result<Self> {
         if let Some(parent) = path.as_ref().parent() {
             std::fs::create_dir_all(parent)?;
         }
         let conn = Connection::open(path)?;
-        Ok(Self { conn })
+        Ok(Self {
+            conn,
+            redaction_policy,
+        })
+    }
+
+    pub fn redaction_policy(&self) -> &RedactionPolicy {
+        &self.redaction_policy
     }
 
     pub fn initialize(&self) -> Result<()> {
@@ -258,6 +280,7 @@ impl Store {
                 cwd TEXT NOT NULL,
                 git_repo TEXT,
                 git_branch TEXT,
+                git_head TEXT,
                 started_at_ms INTEGER NOT NULL,
                 ended_at_ms INTEGER,
                 duration_ms INTEGER,
@@ -362,6 +385,7 @@ impl Store {
         )?;
         self.ensure_executions_column("source", "TEXT NOT NULL DEFAULT 'stillrun'")?;
         self.ensure_executions_column("source_id", "TEXT")?;
+        self.ensure_executions_column("git_head", "TEXT")?;
         self.conn.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_executions_source_id ON executions(source, source_id) WHERE source_id IS NOT NULL",
             [],
@@ -410,7 +434,7 @@ impl Store {
         command_override: Option<&str>,
         ignore_duplicate: bool,
     ) -> Result<Option<i64>> {
-        let prepared = prepare_execution(record, command_override)?;
+        let prepared = prepare_execution(record, command_override, &self.redaction_policy)?;
         let insert_clause = if ignore_duplicate {
             "INSERT OR IGNORE"
         } else {
@@ -421,10 +445,10 @@ impl Store {
             &format!(
                 r#"
             {insert_clause} INTO executions (
-                command, argv_json, cwd, git_repo, git_branch, started_at_ms, ended_at_ms,
+                command, argv_json, cwd, git_repo, git_branch, git_head, started_at_ms, ended_at_ms,
                 duration_ms, exit_code, status, env_json, stdout, stderr, pid,
                 background_job_id, restart_count, source, source_id
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)
             "#
             ),
             params![
@@ -437,6 +461,7 @@ impl Store {
                     .as_ref()
                     .map(|path| path.to_string_lossy().to_string()),
                 record.context.git_branch,
+                record.context.git_head,
                 record.started_at_ms,
                 record.ended_at_ms,
                 record.duration_ms,
@@ -465,7 +490,7 @@ impl Store {
         source_id: &str,
         command_override: &str,
     ) -> Result<()> {
-        let prepared = prepare_execution(record, Some(command_override))?;
+        let prepared = prepare_execution(record, Some(command_override), &self.redaction_policy)?;
         self.conn.execute(
             r#"
             UPDATE executions
@@ -474,17 +499,18 @@ impl Store {
                 cwd = ?5,
                 git_repo = ?6,
                 git_branch = ?7,
-                started_at_ms = ?8,
-                ended_at_ms = ?9,
-                duration_ms = ?10,
-                exit_code = ?11,
-                status = ?12,
-                env_json = ?13,
-                stdout = ?14,
-                stderr = ?15,
-                pid = ?16,
-                background_job_id = ?17,
-                restart_count = ?18
+                git_head = ?8,
+                started_at_ms = ?9,
+                ended_at_ms = ?10,
+                duration_ms = ?11,
+                exit_code = ?12,
+                status = ?13,
+                env_json = ?14,
+                stdout = ?15,
+                stderr = ?16,
+                pid = ?17,
+                background_job_id = ?18,
+                restart_count = ?19
             WHERE source = ?1 AND source_id = ?2 AND status = 'imported'
             "#,
             params![
@@ -499,6 +525,7 @@ impl Store {
                     .as_ref()
                     .map(|path| path.to_string_lossy().to_string()),
                 record.context.git_branch,
+                record.context.git_head,
                 record.started_at_ms,
                 record.ended_at_ms,
                 record.duration_ms,
@@ -593,7 +620,7 @@ impl Store {
     }
 
     pub fn upsert_job(&self, record: &JobRecord) -> Result<()> {
-        let argv = redact::redact_argv(&record.argv);
+        let argv = redact::redact_argv(&record.argv, &self.redaction_policy);
         let argv_json = serde_json::to_string(&argv)?;
         self.conn.execute(
             r#"
@@ -870,17 +897,18 @@ impl Store {
 fn prepare_execution(
     record: &NewExecution,
     command_override: Option<&str>,
+    policy: &RedactionPolicy,
 ) -> Result<PreparedExecution> {
-    let argv = redact::redact_argv(&record.argv);
+    let argv = redact::redact_argv(&record.argv, policy);
     let command_source = command_override
         .map(str::to_string)
         .unwrap_or_else(|| format_argv(&argv));
     Ok(PreparedExecution {
-        command: redact::redact_inline_secrets(&command_source),
+        command: redact::redact_inline_secrets(&command_source, policy),
         argv_json: serde_json::to_string(&argv)?,
         env_json: serde_json::to_string(&record.context.env)?,
-        stdout: redact::redact_inline_secrets(&record.stdout),
-        stderr: redact::redact_inline_secrets(&record.stderr),
+        stdout: redact::redact_inline_secrets(&record.stdout, policy),
+        stderr: redact::redact_inline_secrets(&record.stderr, policy),
     })
 }
 
@@ -925,6 +953,16 @@ fn history_sql(filter: &HistoryFilter) -> String {
         .as_ref()
         .map(|_| " AND e.status = ?")
         .unwrap_or("");
+    let exit_code_clause = filter
+        .exit_code
+        .as_ref()
+        .map(|_| " AND e.exit_code = ?")
+        .unwrap_or("");
+    let branch_clause = filter
+        .branch
+        .as_ref()
+        .map(|_| " AND e.git_branch = ?")
+        .unwrap_or("");
     let started_after_clause = filter
         .started_after_ms
         .as_ref()
@@ -940,7 +978,7 @@ fn history_sql(filter: &HistoryFilter) -> String {
         HistorySortOrder::OldestFirst => "ASC",
     };
     format!(
-        "{prefix}{cwd_clause}{repo_clause}{status_clause}{started_after_clause}{started_before_clause} ORDER BY e.started_at_ms {order}, e.id {order} LIMIT ?"
+        "{prefix}{cwd_clause}{repo_clause}{status_clause}{exit_code_clause}{branch_clause}{started_after_clause}{started_before_clause} ORDER BY e.started_at_ms {order}, e.id {order} LIMIT ?"
     )
 }
 
@@ -977,12 +1015,23 @@ fn history_values(filter: &HistoryFilter) -> Vec<Value> {
         .as_ref()
         .map(|status| Value::Text(status.as_str().to_string()))
         .into_iter();
+    let exit_code_value = filter
+        .exit_code
+        .map(|code| Value::Integer(i64::from(code)))
+        .into_iter();
+    let branch_value = filter
+        .branch
+        .as_ref()
+        .map(|branch| Value::Text(branch.to_string()))
+        .into_iter();
     let started_after_value = filter.started_after_ms.map(Value::Integer).into_iter();
     let started_before_value = filter.started_before_ms.map(Value::Integer).into_iter();
     query_values
         .chain(cwd_value)
         .chain(repo_value)
         .chain(status_value)
+        .chain(exit_code_value)
+        .chain(branch_value)
         .chain(started_after_value)
         .chain(started_before_value)
         .chain(std::iter::once(Value::Integer(
@@ -1036,6 +1085,7 @@ fn map_execution_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ExecutionRecor
         cwd: PathBuf::from(cwd),
         git_repo: git_repo.map(PathBuf::from),
         git_branch: row.get("git_branch")?,
+        git_head: row.get("git_head")?,
         started_at_ms: row.get("started_at_ms")?,
         ended_at_ms: row.get("ended_at_ms")?,
         duration_ms: row.get("duration_ms")?,

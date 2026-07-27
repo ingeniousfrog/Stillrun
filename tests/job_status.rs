@@ -48,3 +48,33 @@ fn parses_process_resource_sample() {
 
     assert_eq!(parsed, Some((1.5, 12345)));
 }
+
+#[test]
+fn parses_process_tree_resources_for_parent_and_children() {
+    let parsed = status::parse_ps_tree_output(
+        r#"
+          10      1   1.0   1000
+          11     10   2.5   2000
+          12     11   3.0   3000
+          20      1  99.0  90000
+        "#,
+        10,
+    );
+
+    assert_eq!(parsed, Some((6.5, 6000)));
+}
+
+#[test]
+fn parses_descendant_pids_without_including_unrelated_processes() {
+    let parsed = status::parse_descendant_pids(
+        r#"
+          10      1
+          11     10
+          12     11
+          20      1
+        "#,
+        10,
+    );
+
+    assert_eq!(parsed, vec![11, 12]);
+}

@@ -3,8 +3,10 @@ use stillrun::{
     jobs::status::RuntimeJobStatus,
     jobs::{
         format_launchd_operation_error, is_already_unloaded_bootout_error,
-        start_action_for_loaded_runtime_status, LaunchdStartAction,
+        start_action_for_loaded_runtime_status, validate_background_argv_is_safe,
+        LaunchdStartAction,
     },
+    redact::RedactionPolicy,
     StillrunError,
 };
 
@@ -59,6 +61,47 @@ fn launchd_operation_errors_name_job_and_recovery_commands() {
     assert!(message.contains("plist=/tmp/dev.plist"));
     assert!(message.contains("stillrun status dev"));
     assert!(message.contains("stillrun jobs delete dev"));
+}
+
+#[test]
+fn background_jobs_reject_sensitive_argv_before_writing_launchd_plists() {
+    let error = validate_background_argv_is_safe(
+        &["curl".into(), "--token".into(), "secret-token".into()],
+        &RedactionPolicy::default(),
+    )
+    .unwrap_err()
+    .to_string();
+
+    assert!(error.contains("sensitive command argument"));
+    assert!(error.contains("launchd plist"));
+}
+
+#[test]
+fn monitor_job_argv_runs_foreground_monitor_loop_under_launchd() {
+    let argv = stillrun::jobs::build_monitor_job_argv(
+        &PathBuf::from("/usr/local/bin/stillrun"),
+        "dev",
+        2,
+        Some(80.0),
+        Some(512),
+    );
+
+    assert_eq!(
+        argv,
+        vec![
+            "/usr/local/bin/stillrun",
+            "jobs",
+            "monitor",
+            "dev",
+            "--interval-secs",
+            "2",
+            "--cpu-alert",
+            "80",
+            "--rss-alert-mb",
+            "512",
+        ]
+    );
+    assert!(!argv.iter().any(|arg| arg == "--background"));
 }
 
 fn runtime_status(status: JobStatus) -> RuntimeJobStatus {
