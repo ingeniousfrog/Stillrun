@@ -5,6 +5,9 @@ edition = "2021"
 rust-version = "1.78"
 description = "A command lifecycle runtime for macOS terminal jobs."
 license = "MIT"
+homepage = "https://github.com/ingeniousfrog/Stillrun"
+repository = "https://github.com/ingeniousfrog/Stillrun"
+readme = "README.md"
 
 [dependencies]
 clap = { version = "4.5", features = ["derive", "env"] }

@@ -50,9 +50,9 @@ pub enum CompletionCandidateKind {
 
 pub fn handle_completion_command(store: &Store, args: CompletionArgs) -> Result<()> {
     match args.action {
-        CompletionCommand::Bash => print!("{}", bash_script()),
-        CompletionCommand::Zsh => print!("{}", zsh_script()),
-        CompletionCommand::Fish => print!("{}", fish_script()),
+        CompletionCommand::Bash | CompletionCommand::Zsh | CompletionCommand::Fish => {
+            print_completion_script(&args);
+        }
         CompletionCommand::Candidates(candidate_args) => {
             let candidates = match candidate_args.kind {
                 CompletionCandidateKind::Commands => command_candidates(&candidate_args.prefix),
@@ -64,6 +64,24 @@ pub fn handle_completion_command(store: &Store, args: CompletionArgs) -> Result<
         }
     }
     Ok(())
+}
+
+pub fn print_completion_script(args: &CompletionArgs) -> bool {
+    match args.action {
+        CompletionCommand::Bash => {
+            print!("{}", bash_script());
+            true
+        }
+        CompletionCommand::Zsh => {
+            print!("{}", zsh_script());
+            true
+        }
+        CompletionCommand::Fish => {
+            print!("{}", fish_script());
+            true
+        }
+        CompletionCommand::Candidates(_) => false,
+    }
 }
 
 pub fn command_candidates(prefix: &str) -> Vec<String> {

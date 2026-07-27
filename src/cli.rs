@@ -57,6 +57,7 @@ Use `stillrun <command> -h` for command-specific flags."#;
 
 #[derive(Debug, Parser)]
 #[command(name = "stillrun")]
+#[command(version)]
 #[command(about = "Command lifecycle runtime for macOS jobs.")]
 #[command(after_help = ROOT_HELP)]
 pub struct Cli {
@@ -312,6 +313,12 @@ pub async fn run() -> Result<()> {
         .try_init();
 
     let cli = Cli::parse();
+    if let Commands::Completion(args) = &cli.command {
+        if crate::completion::print_completion_script(args) {
+            return Ok(());
+        }
+    }
+
     let paths = StillrunPaths::discover()?;
     paths.ensure()?;
     let config = StillrunConfig::load(&paths)?;

@@ -25,6 +25,31 @@ fn cli_short_help_shows_capabilities_and_examples() {
 }
 
 #[test]
+fn cli_version_reports_package_version() {
+    Command::cargo_bin("stillrun")
+        .unwrap()
+        .args(["--version"])
+        .assert()
+        .success()
+        .stdout(contains(env!("CARGO_PKG_VERSION")));
+}
+
+#[test]
+fn cli_static_completion_does_not_open_local_state() {
+    let temp = tempfile::tempdir().unwrap();
+    let state_file = temp.path().join("not-a-directory");
+    fs::write(&state_file, "state path collision").unwrap();
+
+    Command::cargo_bin("stillrun")
+        .unwrap()
+        .env("STILLRUN_HOME", state_file)
+        .args(["completion", "zsh"])
+        .assert()
+        .success()
+        .stdout(contains("#compdef stillrun"));
+}
+
+#[test]
 fn cli_run_records_command_and_history_finds_it() {
     let temp = tempfile::tempdir().unwrap();
 

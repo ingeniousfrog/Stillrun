@@ -44,9 +44,8 @@ non-sensitive environment only—not your current shell session.
 ## Quick start
 
 ```bash
-./scripts/install.sh
-# or non-interactive:
-cargo install --path .
+brew tap ingeniousfrog/tap
+brew install stillrun
 ```
 
 Verify:
@@ -58,8 +57,13 @@ stillrun run --shell 'npm run dev 2>&1 | tee dev.log'
 stillrun history --query hello
 ```
 
-The installer can optionally import existing shell history and install a shell
-hook after you approve the prompts.
+After installing, you can optionally import existing shell history and install a
+shell hook:
+
+```bash
+stillrun import-history --shell auto --preview
+stillrun hook install --shell auto
+```
 
 ---
 
@@ -109,12 +113,14 @@ sequenceDiagram
 
 ## Installation
 
-**Current version:** `0.1.0` (source install)
+**Current version:** `0.1.0`
 
 | Method | Command |
 | --- | --- |
-| Interactive | `./scripts/install.sh` |
-| Non-interactive | `cargo install --path .` |
+| Homebrew | `brew tap ingeniousfrog/tap && brew install stillrun` |
+| Homebrew direct | `brew install ingeniousfrog/tap/stillrun` |
+| Source interactive | `./scripts/install.sh` |
+| Source non-interactive | `cargo install --path .` |
 | Dev binary | `cargo run -- <args>` |
 
 Requires Rust **1.78+** and macOS (background Jobs use launchd).
@@ -222,6 +228,8 @@ cargo clippy --all-targets -- -D warnings
 cargo test
 cargo build --release
 ```
+
+Release packaging and Homebrew tap maintenance live in [`packaging/`](packaging/README.md).
 
 Real launchd lifecycle E2E (touches the user launchd session):
 

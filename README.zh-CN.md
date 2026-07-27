@@ -39,9 +39,8 @@ Stillrun 把终端命令变成可搜索、可检查的记录。常用命令可�
 ## 快速开始
 
 ```bash
-./scripts/install.sh
-# 或非交互安装：
-cargo install --path .
+brew tap ingeniousfrog/tap
+brew install stillrun
 ```
 
 验证：
@@ -53,7 +52,12 @@ stillrun run --shell 'npm run dev 2>&1 | tee dev.log'
 stillrun history --query hello
 ```
 
-安装脚本在你确认后，可导入本机 shell history，并安装 shell hook。
+安装后可按需导入本机 shell history，并安装 shell hook：
+
+```bash
+stillrun import-history --shell auto --preview
+stillrun hook install --shell auto
+```
 
 ---
 
@@ -103,12 +107,14 @@ sequenceDiagram
 
 ## 安装
 
-**当前版本：** `0.1.0`（源码安装）
+**当前版本：** `0.1.0`
 
 | 方式 | 命令 |
 | --- | --- |
-| 交互安装 | `./scripts/install.sh` |
-| 非交互安装 | `cargo install --path .` |
+| Homebrew | `brew tap ingeniousfrog/tap && brew install stillrun` |
+| Homebrew 直接安装 | `brew install ingeniousfrog/tap/stillrun` |
+| 源码交互安装 | `./scripts/install.sh` |
+| 源码非交互安装 | `cargo install --path .` |
 | 开发态 | `cargo run -- <args>` |
 
 需要 Rust **1.78+**，以及 macOS（后台 Job 依赖 launchd）。
@@ -206,6 +212,8 @@ cargo clippy --all-targets -- -D warnings
 cargo test
 cargo build --release
 ```
+
+Release 打包和 Homebrew tap 维护说明见 [`packaging/`](packaging/README.md)。
 
 真实 launchd 生命周期 E2E（会触碰用户 launchd 会话）：
 
