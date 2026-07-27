@@ -9,12 +9,12 @@ class Stillrun < Formula
   on_macos do
     on_arm do
       url "https://github.com/ingeniousfrog/Stillrun/releases/download/v0.1.0/stillrun-aarch64-apple-darwin.tar.gz"
-      sha256 "47abb9b079987ce6132be9b19d08a74f0170779a71a1e748b2cf0576cc985dc4"
+      sha256 "61c9283b24f6743f3b85d7cc84dc7e98743df0f5c803976b2166fc7c210bd05d"
     end
 
     on_intel do
       url "https://github.com/ingeniousfrog/Stillrun/releases/download/v0.1.0/stillrun-x86_64-apple-darwin.tar.gz"
-      sha256 "637f90bb05e79992b25dddfd469d7734ba5b64f169722e3bc96f887d527b5c5d"
+      sha256 "8f89d74f36b31977ac9ac5d8c82ef3b2e2b44f3757647bd242e871dd079ca0e6"
     end
   end
 
